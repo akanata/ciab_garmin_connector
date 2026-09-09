@@ -24,6 +24,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "BOTTLE_APP_DATA_DIR",
         "OPENHOST_APP_DATA_DIR",
         "GARMIN_HOME_TZ",
+        "GARMIN_IMPORT_TZ",
         "GARMIN_DOMAIN",
         "SYNC_INTERVAL_SECONDS",
     ):

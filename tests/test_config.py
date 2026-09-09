@@ -72,6 +72,18 @@ def test_home_tz_is_validated_as_a_real_zone() -> None:
     assert settings_from_env({"GARMIN_HOME_TZ": "America/Denver"}).home_tz == "America/Denver"
 
 
+def test_import_tz_is_read_and_validated() -> None:
+    """Names the TZ the GarminDB corpus was imported under, when it was not the
+    home zone. Exact, unlike the offset learned from the data."""
+    assert settings_from_env({"GARMIN_IMPORT_TZ": "UTC"}).import_tz == "UTC"
+    assert settings_from_env({}).import_tz is None
+
+
+def test_bogus_import_tz_fails_at_startup() -> None:
+    with pytest.raises(ConfigError):
+        settings_from_env({"GARMIN_IMPORT_TZ": "Mars/Olympus_Mons"})
+
+
 def test_bogus_home_tz_fails_at_startup_rather_than_silently() -> None:
     """A wrong timezone corrupts every emitted timestamp and would not be noticed
     for months, so an unresolvable zone must fail loudly here."""

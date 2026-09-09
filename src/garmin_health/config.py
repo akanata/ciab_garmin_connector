@@ -31,6 +31,7 @@ class Settings:
     app_data_dir: Path
     garmin_domain: str = "garmin.com"
     home_tz: str | None = None
+    import_tz: str | None = None
     sync_interval_seconds: int = DEFAULT_SYNC_INTERVAL_SECONDS
 
     @property
@@ -78,17 +79,20 @@ def _sync_interval_from(env: Mapping[str, str]) -> int:
     return seconds
 
 
-def _home_tz_from(env: Mapping[str, str]) -> str | None:
-    name = env.get("GARMIN_HOME_TZ", "").strip()
-    if not name:
+def _zone_from(env: Mapping[str, str], name: str) -> str | None:
+    """Read and validate an IANA zone name.
+
+    A wrong timezone silently shifts every timestamp we emit and would not be
+    noticed for months, so an unresolvable zone fails at startup instead.
+    """
+    value = env.get(name, "").strip()
+    if not value:
         return None
     try:
-        ZoneInfo(name)
+        ZoneInfo(value)
     except Exception as exc:
-        # A wrong home timezone silently shifts every timestamp we emit and would
-        # not be noticed for months. Fail at startup instead.
-        raise ConfigError(f"GARMIN_HOME_TZ is not a known IANA timezone: {name!r}") from exc
-    return name
+        raise ConfigError(f"{name} is not a known IANA timezone: {value!r}") from exc
+    return value
 
 
 def settings_from_env(env: Mapping[str, str] | None = None) -> Settings:
@@ -108,6 +112,9 @@ def settings_from_env(env: Mapping[str, str] | None = None) -> Settings:
     return Settings(
         app_data_dir=app_data_dir,
         garmin_domain=domain,
-        home_tz=_home_tz_from(env),
+        home_tz=_zone_from(env, "GARMIN_HOME_TZ"),
+        # The TZ the existing GarminDB corpus was imported under, if it was not the
+        # home zone. Without it the skew is learned from the data instead.
+        import_tz=_zone_from(env, "GARMIN_IMPORT_TZ"),
         sync_interval_seconds=_sync_interval_from(env),
     )

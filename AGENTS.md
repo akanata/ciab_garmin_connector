@@ -17,15 +17,20 @@ The current iteration covers heart rate (`specific_types.py`) and sleep
 **Landed:** the toolchain (`pyproject.toml`, `uv.lock`, `justfile` — note `just`
 itself may not be installed, in which case run the underlying `uv run …`
 commands), the Garmin auth flow (`config.py`, `garmin_config.py`, `auth.py`,
-`routes/owner.py`, `app.py`), and containerization (`Dockerfile`,
-`openhost.toml`). `requirements.txt` is gone; dependencies live in
-`pyproject.toml` and are pinned by `uv.lock`.
+`routes/owner.py`, `app.py`), containerization (`Dockerfile`, `openhost.toml`),
+and the timezone strategy (`timezones.py`, `garmin/timezone_probe.py`, with
+`tests/fixtures.py` building a real GarminDB SQLite corpus in a tmpdir).
+`requirements.txt` is gone; dependencies live in `pyproject.toml` and are pinned
+by `uv.lock`.
 
-**Not built yet:** the sync engine (`sync.py`) and the entire serving layer
-(`registry.py`, `service.py`, `timezones.py`, `garmin/*`, `routes/service.py`).
-`/v1/*` therefore 404s today even though `openhost.toml` already advertises the
-service — which is safe, because the spec's client treats any non-200 from a
-provider as "this provider has nothing".
+**Not built yet:** the sync engine (`sync.py`) and the rest of the serving layer
+(`registry.py`, `service.py`, `garmin/connection.py` and the other `garmin/*`
+modules, `routes/service.py`). `/v1/*` therefore 404s today even though
+`openhost.toml` already advertises the service — which is safe, because the
+spec's client treats any non-200 from a provider as "this provider has nothing".
+
+`resolve_policy()` is implemented and tested but **not yet wired into startup**:
+`garmin/connection.py` (§4a) is what should call it once, at boot.
 
 ## Important References
 
@@ -113,7 +118,20 @@ imported only by `garmin/*`.
 - `import_offset` applies to `sleep.start`/`sleep.end` **only**. Everything
   else converts via `home_tz` alone.
 - Query bounds must be **naive**. SQLAlchemy's SQLite `DATETIME` bind processor
-  discards `tzinfo`, so an aware bound silently mis-filters with no error.
+  discards `tzinfo`, so an aware bound silently mis-filters with no error — it
+  returns a plausible *subset*, not an error and not nothing
+  (`test_an_aware_bound_silently_selects_the_wrong_rows` demonstrates it).
+- `TimeZonePolicy.to_utc` / `.to_naive_local` **reject** inputs of the wrong
+  awareness. Both would otherwise succeed silently: `.replace(tzinfo=...)`
+  relabels an aware value, and `.astimezone()` on a naive one assumes the
+  *system* zone.
+- A learned scalar `import_offset` can only be right for one side of a DST
+  transition when the import zone and the home zone change clocks on different
+  dates. `GARMIN_IMPORT_TZ` names the import zone instead and is exact; prefer
+  it whenever the corpus was imported under a known non-home `TZ`.
+- The import-offset probe anchors its event search on `sleep.day`, not
+  `sleep.start`, because `day` and `sleep_events` are both on the home clock —
+  so the search window does not move with the very offset being learned.
 
 **Spec conformance.**
 
