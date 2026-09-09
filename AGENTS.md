@@ -171,3 +171,8 @@ imported only by `garmin/*`.
   owner must re-enter their credentials.
 - The token path must be exactly `<config_dir>/garmin_tokens.json`, which is
   what `GarminConnectConfigManager.get_token_store_file()` returns.
+- A sign-in failure is a **one-shot flash** (`take_error()`), not part of
+  `AuthStatus`. `AuthStatus.detail` is derived from the link state alone and must
+  stay idempotent: anything sticky stored there is re-rendered on every later GET
+  of `/setup`, so one mistyped password would accuse the owner forever. `/setup`
+  consumes the flash; the pollable `/setup/status` only peeks.

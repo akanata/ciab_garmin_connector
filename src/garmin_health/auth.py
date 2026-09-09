@@ -91,23 +91,44 @@ class GarminAuthenticator:
         self._lock = Lock()
         self._pending: _PendingLogin | None = None
         self._email: str | None = config_user(settings)
-        self._detail: str | None = None
+        # A one-shot flash, not part of the status. Stored on the authenticator it
+        # would be re-rendered on every later GET of /setup, so a single mistyped
+        # password would keep accusing the owner indefinitely.
+        self._error: str | None = None
         # Remembering that a token once existed is what distinguishes "never set up"
         # from "the token went away and the owner has to sign in again".
         self._was_linked = settings.token_file.is_file()
 
     def status(self) -> AuthStatus:
+        """The link state and the guidance that follows from it.
+
+        ``detail`` is derived from the state alone, so reading it is idempotent.
+        Failures are not status -- they are a flash, read with take_error().
+        """
         if self._settings.token_file.is_file():
-            return AuthStatus(LinkState.LINKED, self._email, self._detail)
+            return AuthStatus(LinkState.LINKED, self._email)
         if self._pending is not None:
-            return AuthStatus(LinkState.AWAITING_MFA, self._pending.email, self._detail)
+            return AuthStatus(
+                LinkState.AWAITING_MFA,
+                self._pending.email,
+                "Enter the code Garmin just sent you to finish linking.",
+            )
         if self._was_linked:
             return AuthStatus(
                 LinkState.NEEDS_REAUTH,
                 self._email,
                 "The saved Garmin token is no longer on disk. Sign in again to relink.",
             )
-        return AuthStatus(LinkState.NOT_LINKED, self._email, self._detail)
+        return AuthStatus(LinkState.NOT_LINKED, self._email)
+
+    def peek_error(self) -> str | None:
+        """Read the pending failure without clearing it (for pollable endpoints)."""
+        return self._error
+
+    def take_error(self) -> str | None:
+        """Read and clear the pending failure, so a refresh does not repeat it."""
+        error, self._error = self._error, None
+        return error
 
     async def login(self, email: str, password: str) -> AuthStatus:
         """Start a login. GarminDB and garminconnect are entirely synchronous, so
@@ -121,7 +142,7 @@ class GarminAuthenticator:
         return await anyio.to_thread.run_sync(self._unlink_sync)
 
     def _fail(self, message: str) -> AuthError:
-        self._detail = message
+        self._error = message
         return AuthError(message)
 
     def _persist_tokens(self, client: Any) -> None:
@@ -146,7 +167,7 @@ class GarminAuthenticator:
 
         with self._lock:
             self._pending = None
-            self._detail = None
+            self._error = None
             ensure_config(self._settings, user=email)
 
             client = self._factory(
@@ -164,13 +185,12 @@ class GarminAuthenticator:
             if mfa_status == NEEDS_MFA:
                 self._pending = _PendingLogin(client=client, email=email)
                 self._email = email
-                self._detail = "Garmin sent a verification code. Enter it to finish linking."
                 return self.status()
 
             self._persist_tokens(client)
             self._email = email
             self._was_linked = True
-            self._detail = None
+            self._error = None
             return self.status()
 
     def _complete_mfa_sync(self, code: str) -> AuthStatus:
@@ -199,7 +219,7 @@ class GarminAuthenticator:
             self._pending = None
             self._email = pending.email
             self._was_linked = True
-            self._detail = None
+            self._error = None
             return self.status()
 
     def _unlink_sync(self) -> AuthStatus:
@@ -207,5 +227,5 @@ class GarminAuthenticator:
             self._pending = None
             self._settings.token_file.unlink(missing_ok=True)
             self._was_linked = False
-            self._detail = None
+            self._error = None
             return self.status()

@@ -166,3 +166,114 @@ def test_setup_page_escapes_the_email(settings: Settings) -> None:
             headers=OWNER,
         )
         assert "<script>alert(1)</script>" not in client.get("/setup", headers=OWNER).text
+
+
+def test_a_failed_sign_in_message_does_not_survive_a_refresh(settings: Settings) -> None:
+    """Regression: the failure was stored on the authenticator and re-rendered on
+    every GET, so /setup kept reporting a sign-in failure indefinitely."""
+    factory = RecordingFactory(login_error=GarminConnectAuthenticationError("bad password"))
+    app = create_app(
+        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+    )
+    with TestClient(app=app) as client:
+        first = client.post(
+            "/setup/credentials",
+            data={"email": "rider@example.com", "password": "wrong"},
+            headers=OWNER,
+            follow_redirects=True,
+        )
+        assert "failed" in first.text.lower()
+
+        refreshed = client.get("/setup", headers=OWNER)
+        assert "failed" not in refreshed.text.lower()
+        assert "class='error'" not in refreshed.text
+
+
+def test_a_failed_mfa_message_does_not_survive_a_refresh(settings: Settings) -> None:
+    factory = RecordingFactory(needs_mfa=True, mfa_code="654321")
+    app = create_app(
+        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+    )
+    with TestClient(app=app) as client:
+        client.post(
+            "/setup/credentials",
+            data={"email": "rider@example.com", "password": "hunter2"},
+            headers=OWNER,
+        )
+        first = client.post(
+            "/setup/mfa", data={"code": "000000"}, headers=OWNER, follow_redirects=True
+        )
+        assert "not accepted" in first.text.lower()
+        assert "not accepted" not in client.get("/setup", headers=OWNER).text.lower()
+
+
+def test_status_endpoint_reports_the_error_without_consuming_it(settings: Settings) -> None:
+    factory = RecordingFactory(login_error=GarminConnectAuthenticationError("bad password"))
+    app = create_app(
+        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+    )
+    with TestClient(app=app) as client:
+        client.post(
+            "/setup/credentials",
+            data={"email": "rider@example.com", "password": "wrong"},
+            headers=OWNER,
+            follow_redirects=False,
+        )
+        assert client.get("/setup/status", headers=OWNER).json()["error"] is not None
+        # Polling status must not steal the message the page still has to show.
+        assert "failed" in client.get("/setup", headers=OWNER).text.lower()
+        assert client.get("/setup/status", headers=OWNER).json()["error"] is None
+
+
+def test_the_awaiting_mfa_prompt_is_not_a_flash(settings: Settings) -> None:
+    """State-derived guidance must persist across refreshes, unlike an error."""
+    factory = RecordingFactory(needs_mfa=True)
+    app = create_app(
+        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+    )
+    with TestClient(app=app) as client:
+        client.post(
+            "/setup/credentials",
+            data={"email": "rider@example.com", "password": "hunter2"},
+            headers=OWNER,
+        )
+        assert "code" in client.get("/setup", headers=OWNER).text.lower()
+        assert "code" in client.get("/setup", headers=OWNER).text.lower()
+
+
+def test_sign_in_form_declares_an_in_flight_message(client: TestClient) -> None:
+    """A real Garmin sign-in is a multi-second SSO round-trip; the page has to say
+    something is happening or the owner assumes the button did nothing."""
+    page = client.get("/setup", headers=OWNER).text
+    assert "data-busy=" in page
+    assert "Contacting Garmin" in page
+    assert "spinner" in page
+
+
+def test_mfa_form_declares_an_in_flight_message(settings: Settings) -> None:
+    factory = RecordingFactory(needs_mfa=True)
+    app = create_app(
+        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+    )
+    with TestClient(app=app) as client:
+        client.post(
+            "/setup/credentials",
+            data={"email": "rider@example.com", "password": "hunter2"},
+            headers=OWNER,
+        )
+        page = client.get("/setup", headers=OWNER).text
+        assert "data-busy=" in page
+        assert "Verifying" in page
+
+
+def test_the_form_still_posts_without_javascript(client: TestClient) -> None:
+    """The busy widget is progressive enhancement: the plain form POST is what
+    actually submits, so a blocked inline script must not break linking."""
+    response = client.post(
+        "/setup/credentials",
+        data={"email": "rider@example.com", "password": "hunter2"},
+        headers=OWNER,
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert client.get("/setup/status", headers=OWNER).json()["state"] == "linked"

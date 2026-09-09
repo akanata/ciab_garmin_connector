@@ -156,3 +156,51 @@ async def test_status_never_exposes_the_password(settings: Settings) -> None:
     auth, _ = make_auth(settings, needs_mfa=True)
     await auth.login("rider@example.com", "hunter2")
     assert "hunter2" not in json.dumps(auth.status().as_dict())
+
+
+async def test_a_failure_message_is_reported_once_and_then_cleared(settings: Settings) -> None:
+    """The error is a one-shot flash. Left sticky, it would still be accusing the
+    owner of a bad password on every later visit to /setup."""
+    auth, _ = make_auth(settings, login_error=GarminConnectAuthenticationError("bad password"))
+    with pytest.raises(AuthError):
+        await auth.login("rider@example.com", "wrong")
+    first = auth.take_error()
+    assert first is not None and "failed" in first.lower()
+    assert auth.take_error() is None
+
+
+async def test_peeking_at_the_error_does_not_consume_it(settings: Settings) -> None:
+    """/setup/status is pollable, so reading it must not eat the flash that /setup
+    is about to render."""
+    auth, _ = make_auth(settings, login_error=GarminConnectAuthenticationError("bad password"))
+    with pytest.raises(AuthError):
+        await auth.login("rider@example.com", "wrong")
+    assert auth.peek_error() is not None
+    assert auth.peek_error() is not None
+    assert auth.take_error() is not None
+
+
+async def test_status_detail_never_carries_a_failure(settings: Settings) -> None:
+    """detail is state-derived guidance and must stay idempotent; errors travel
+    separately so they can be consumed."""
+    auth, _ = make_auth(settings, login_error=GarminConnectAuthenticationError("bad password"))
+    with pytest.raises(AuthError):
+        await auth.login("rider@example.com", "wrong")
+    assert auth.status().detail is None
+
+
+async def test_a_later_success_clears_an_earlier_failure(settings: Settings) -> None:
+    factory = RecordingFactory(login_error=GarminConnectAuthenticationError("bad password"))
+    auth = GarminAuthenticator(settings, garmin_factory=factory)
+    with pytest.raises(AuthError):
+        await auth.login("rider@example.com", "wrong")
+    factory.client_kwargs.pop("login_error")
+    await auth.login("rider@example.com", "hunter2")
+    assert auth.peek_error() is None
+
+
+async def test_awaiting_mfa_detail_survives_being_read_twice(settings: Settings) -> None:
+    auth, _ = make_auth(settings, needs_mfa=True)
+    await auth.login("rider@example.com", "hunter2")
+    assert auth.status().detail == auth.status().detail
+    assert auth.status().detail is not None
