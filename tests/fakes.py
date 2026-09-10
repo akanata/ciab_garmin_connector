@@ -15,10 +15,13 @@ off garminconnect 0.3.11:
 """
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
 from garminconnect import GarminConnectAuthenticationError
+
+from garmin_health.sync import TableStat
 
 
 class FakeInnerClient:
@@ -104,3 +107,50 @@ class RecordingFactory:
         client = FakeGarmin(**{**kwargs, **self.client_kwargs})
         self.clients.append(client)
         return client
+
+
+class FakeIngest:
+    """Stands in for garmin/ingest.py: records the sequence without touching GarminDB."""
+
+    def __init__(
+        self,
+        *,
+        stats_sequence: list[dict[str, Any]] | None = None,
+        fail_on: str | None = None,
+        block_on: Any | None = None,
+    ) -> None:
+        default = {"sleep": TableStat(rows=1, latest="2026-06-14T23:00:00")}
+        self._stats_sequence = stats_sequence or [default, default]
+        self._fail_on = fail_on
+        self._block_on = block_on
+        self.calls: list[str] = []
+        self.thread_ids: list[int] = []
+        self.stop_event: Any | None = None
+
+    def _record(self, name: str) -> None:
+        self.calls.append(name)
+        self.thread_ids.append(threading.get_ident())
+        if self._fail_on == name:
+            raise RuntimeError(f"boom in {name}")
+
+    def table_stats(self) -> dict[str, Any]:
+        self.calls.append("table_stats")
+        self.thread_ids.append(threading.get_ident())
+        seen = self.calls.count("table_stats")
+        if self._fail_on == "table_stats_after" and seen > 1:
+            raise RuntimeError("boom reading stats")
+        index = min(seen - 1, len(self._stats_sequence) - 1)
+        return dict(self._stats_sequence[index])
+
+    def download(self, stop: Any) -> None:
+        self.stop_event = stop
+        if self._block_on is not None:
+            self._block_on.wait(5)
+        self._record("download")
+
+    def import_(self, stop: Any) -> None:
+        self.stop_event = stop
+        self._record("import")
+
+    def analyze(self) -> None:
+        self._record("analyze")

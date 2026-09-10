@@ -14,23 +14,30 @@ maps those rows into `health_data_service` types over the spec's HTTP contract.
 The current iteration covers heart rate (`specific_types.py`) and sleep
 (`sleep_types.py`); workouts are out of scope.
 
-**Landed:** the toolchain (`pyproject.toml`, `uv.lock`, `justfile` — note `just`
-itself may not be installed, in which case run the underlying `uv run …`
-commands), the Garmin auth flow (`config.py`, `garmin_config.py`, `auth.py`,
-`routes/owner.py`, `app.py`), containerization (`Dockerfile`, `openhost.toml`),
-and the timezone strategy (`timezones.py`, `garmin/timezone_probe.py`, with
-`tests/fixtures.py` building a real GarminDB SQLite corpus in a tmpdir).
+**Landed — all of plan.md Parts 1–3:** the toolchain (`pyproject.toml`,
+`uv.lock`, `justfile` — note `just` itself may not be installed, in which case
+run the underlying `uv run …` commands), the Garmin auth flow (`config.py`,
+`garmin_config.py`, `auth.py`, `routes/owner.py`, `app.py`), containerization
+(`Dockerfile`, `openhost.toml`), the timezone strategy (`timezones.py`,
+`garmin/timezone_probe.py`), and the sync engine (`sync.py`,
+`garmin/ingest.py`) with `POST /sync`, `GET /sync/status` and the interval loop.
+`tests/fixtures.py` builds a real GarminDB SQLite corpus in a tmpdir.
 `requirements.txt` is gone; dependencies live in `pyproject.toml` and are pinned
 by `uv.lock`.
 
-**Not built yet:** the sync engine (`sync.py`) and the rest of the serving layer
-(`registry.py`, `service.py`, `garmin/connection.py` and the other `garmin/*`
-modules, `routes/service.py`). `/v1/*` therefore 404s today even though
-`openhost.toml` already advertises the service — which is safe, because the
-spec's client treats any non-200 from a provider as "this provider has nothing".
+**Not built yet:** the serving layer (`registry.py`, `service.py`,
+`garmin/connection.py` and the other `garmin/*` modules, `routes/service.py`).
+`/v1/*` therefore 404s today even though `openhost.toml` already advertises the
+service — which is safe, because the spec's client treats any non-200 from a
+provider as "this provider has nothing".
 
 `resolve_policy()` is implemented and tested but **not yet wired into startup**:
 `garmin/connection.py` (§4a) is what should call it once, at boot.
+
+**Environment knobs:** `GARMIN_HOME_TZ`, `GARMIN_IMPORT_TZ`,
+`GARMIN_BACKFILL_START_DATE` (default `2019-12-31`; a full backfill is roughly
+one second per day *per stat*, so the default is hours on first run),
+`SYNC_INTERVAL_SECONDS` (default 6h), `GARMIN_DOMAIN`, `BOTTLE_APP_DATA_DIR`.
 
 ## Important References
 
@@ -166,6 +173,39 @@ imported only by `garmin/*`.
 - Persist **both** the config dir (for `garmin_tokens.json`) and the HealthData
   tree. Retaining the raw JSON/FIT corpus means a schema rebuild needs no
   re-download.
+- `Download.login()` returns **False** rather than raising on an auth failure.
+  Unchecked, a sync carries on and "succeeds" having fetched nothing.
+- `Download` builds its auth adapter with the default `mfa_prompt`, a blocking
+  `input()` on stdin. `ingest.py` overwrites it with one that raises; in a
+  container the default would hang a worker thread for ever.
+- Importers are given `latest=True`, which means "files whose mtime is in the
+  last 24h", not "the newest N". That is only safe because the download step has
+  just rewritten those files. A file that failed to import on an earlier run is
+  never retried — row counts in `/sync/status` are what make that visible, and
+  there is no full-reimport endpoint yet.
+- `download_days_overlap` is a hardcoded class attribute on `Download` (`3`),
+  **not** read from config — `gc_config.download_days_overlap()` returns `None`
+  with our config and is simply unused. Do not "fix" it.
+
+**Sync.**
+
+- `sync.py` imports **no** `garmindb`: it drives an `Ingest` port that
+  `garmin/ingest.py` implements. That is what keeps the whole sequence testable
+  with no account and no network — keep it that way.
+- The phase order is not optional: the profile importers must precede anything
+  reading `measurement_system`, and `analyze` runs last.
+- A sync that reports success but grows **no** table is the signature of
+  GarminDB swallowing every per-file error. `SyncReport.changed` and `row_delta`
+  exist for exactly that, and it is logged as a warning.
+- A download sleeps a second per day and retries 5× with backoff, so it cannot
+  be interrupted mid-call. The stop flag is checked between stats and phases;
+  shutdown abandons the thread (`abandon_on_cancel=True`) rather than waiting
+  minutes for it.
+- `POST /sync` is fire-and-forget and returns `202` immediately — a first
+  backfill runs for tens of minutes. Tests must poll `/sync/status`, not assume
+  the next request sees a result.
+- The loop **sleeps before its first sync**, so a crash-looping container cannot
+  replay a Garmin sign-in on every restart.
 
 **Auth.**
 

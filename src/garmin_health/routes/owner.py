@@ -21,16 +21,20 @@ from litestar.connection import ASGIConnection
 from litestar.datastructures import State
 from litestar.enums import MediaType
 from litestar.enums import RequestEncodingType
+from litestar.exceptions import HTTPException
 from litestar.exceptions import NotAuthorizedException
 from litestar.handlers.base import BaseRouteHandler
 from litestar.params import Body
 from litestar.response import Redirect
+from litestar.status_codes import HTTP_202_ACCEPTED
 from litestar.status_codes import HTTP_303_SEE_OTHER
+from litestar.status_codes import HTTP_409_CONFLICT
 
 from garmin_health.auth import AuthError
 from garmin_health.auth import AuthStatus
 from garmin_health.auth import GarminAuthenticator
 from garmin_health.auth import LinkState
+from garmin_health.sync import SyncEngine
 
 PASSWORD_NOTICE = (
     "Garmin does not offer a consent-based API outside its developer portal, so linking "
@@ -48,6 +52,28 @@ def owner_guard(connection: ASGIConnection[Any, Any, Any, Any], _: BaseRouteHand
 def _authenticator(state: State) -> GarminAuthenticator:
     authenticator: GarminAuthenticator = state.authenticator
     return authenticator
+
+
+def _sync_engine(state: State) -> SyncEngine:
+    engine: SyncEngine = state.sync_engine
+    return engine
+
+
+def _describe_last_sync(engine: SyncEngine) -> str:
+    """One line of sync state for the owner, in plain words."""
+    status = engine.status()
+    if status["running"]:
+        return "A sync is running now."
+    last = status["last_sync"]
+    if last is None:
+        return "Not synced yet."
+    when = escape(str(last["finished_at"]))
+    if last["error"]:
+        return f"Last sync failed during {escape(str(last['phase']))} at {when}: {escape(str(last['error']))}"
+    rows = sum(table["rows"] for table in last["tables"].values())
+    if not last["changed"]:
+        return f"Last sync finished at {when} and added nothing new ({rows} rows held)."
+    return f"Last sync finished at {when} ({rows} rows held)."
 
 
 # Progressive enhancement only. The plain form POST is what submits; this just
@@ -87,6 +113,7 @@ STYLE = (
     ".detail{padding:.75rem;background:#fff4e5;border-left:3px solid #d97706}"
     ".warning,.note{color:#555;font-size:.875rem}"
     ".busy{color:#555;font-size:.875rem;margin-top:.5rem}"
+    ".sync{padding:.75rem;background:#eef6ff;border-left:3px solid #2563eb}"
     ".spinner{display:none;width:.85em;height:.85em;margin-right:.5em;vertical-align:-.1em;"
     "border:2px solid currentColor;border-right-color:transparent;border-radius:50%;"
     "animation:spin .7s linear infinite}"
@@ -101,7 +128,7 @@ def _button(label: str) -> str:
     return f"<button type='submit'><span class='spinner' aria-hidden='true'></span>{escape(label)}</button>"
 
 
-def _render(status: AuthStatus, error: str | None = None) -> str:
+def _render(status: AuthStatus, error: str | None = None, sync_summary: str = "") -> str:
     email = escape(status.email or "", quote=True)
 
     if status.state is LinkState.LINKED:
@@ -132,6 +159,12 @@ def _render(status: AuthStatus, error: str | None = None) -> str:
         )
     elif status.state is LinkState.LINKED:
         body.append(
+            f"<p class='sync'>{sync_summary}</p>"
+            "<form method='post' action='/sync' data-busy='Starting a sync...'>"
+            + _button("Sync now")
+            + "</form>"
+            "<p class='note'>A first sync backfills years of data and can run for tens of minutes. "
+            "It continues in the background; this page does not need to stay open.</p>"
             "<form method='post' action='/setup/unlink'>"
             + _button("Unlink this Garmin account")
             + "</form>"
@@ -167,7 +200,11 @@ def setup_page(state: State) -> str:
     authenticator = _authenticator(state)
     # take_error(), not peek: rendering the failure consumes it, so refreshing the
     # page does not keep reporting a sign-in that failed once.
-    return _render(authenticator.status(), authenticator.take_error())
+    return _render(
+        authenticator.status(),
+        authenticator.take_error(),
+        _describe_last_sync(_sync_engine(state)),
+    )
 
 
 @get("/setup/status", sync_to_thread=False)
@@ -211,8 +248,39 @@ async def unlink(state: State) -> Redirect:
     return Redirect("/setup", status_code=HTTP_303_SEE_OTHER)
 
 
+@post("/sync", status_code=HTTP_202_ACCEPTED)
+async def trigger_sync(state: State) -> dict[str, object]:
+    """Kick off a sync now. Returns immediately; the work runs in the background."""
+    authenticator = _authenticator(state)
+    if authenticator.status().state is not LinkState.LINKED:
+        # Silently doing nothing would look like a working sync that never
+        # produces data, which is far harder to diagnose than a refusal.
+        raise HTTPException(
+            status_code=HTTP_409_CONFLICT,
+            detail="Cannot sync until the Garmin account is linked. Visit /setup.",
+        )
+    started = await _sync_engine(state).trigger()
+    return {
+        "started": started,
+        "detail": "Sync started." if started else "A sync is already running.",
+    }
+
+
+@get("/sync/status", sync_to_thread=False)
+def sync_status(state: State) -> dict[str, object]:
+    return _sync_engine(state).status()
+
+
 owner_router = Router(
     path="/",
-    route_handlers=[setup_page, setup_status, submit_credentials, submit_mfa, unlink],
+    route_handlers=[
+        setup_page,
+        setup_status,
+        submit_credentials,
+        submit_mfa,
+        unlink,
+        trigger_sync,
+        sync_status,
+    ],
     guards=[owner_guard],
 )

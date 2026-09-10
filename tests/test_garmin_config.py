@@ -41,6 +41,15 @@ def test_out_of_scope_stats_are_disabled(settings: Settings) -> None:
     assert enabled["steps"] is False
 
 
+def test_backfill_start_date_reaches_every_stat(settings: Settings) -> None:
+    tuned = Settings(app_data_dir=settings.app_data_dir, backfill_start_date="2025-01-01")
+    data = render_config(tuned)["data"]
+    assert data["sleep_start_date"] == "2025-01-01"
+    assert data["monitoring_start_date"] == "2025-01-01"
+    assert data["rhr_start_date"] == "2025-01-01"
+    assert data["hrv_start_date"] == "2025-01-01"
+
+
 def test_password_is_never_rendered_into_the_config(settings: Settings) -> None:
     """We do our own login and hand GarminDB the resulting token, so the owner's
     Garmin password never needs to touch disk at all."""

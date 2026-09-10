@@ -8,9 +8,13 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import attrs
+import dateutil.parser
 
 DEFAULT_APP_DATA_DIR = Path("data")
 DEFAULT_SYNC_INTERVAL_SECONDS = 6 * 60 * 60
+# Matches GarminDB's own example. Downloads run ~1 second per day per stat, so a
+# backfill from here is hours on first run; GARMIN_BACKFILL_START_DATE shortens it.
+DEFAULT_BACKFILL_START_DATE = "2019-12-31"
 SUPPORTED_DOMAINS = ("garmin.com", "garmin.cn")
 
 
@@ -32,6 +36,7 @@ class Settings:
     garmin_domain: str = "garmin.com"
     home_tz: str | None = None
     import_tz: str | None = None
+    backfill_start_date: str = DEFAULT_BACKFILL_START_DATE
     sync_interval_seconds: int = DEFAULT_SYNC_INTERVAL_SECONDS
 
     @property
@@ -95,6 +100,19 @@ def _zone_from(env: Mapping[str, str], name: str) -> str | None:
     return value
 
 
+def _backfill_start_date_from(env: Mapping[str, str]) -> str:
+    """Validate the way GarminDB will parse it: an unparseable *_date value reaches
+    GarminConnectConfigManager's sys.exit(-1)."""
+    value = env.get("GARMIN_BACKFILL_START_DATE", "").strip()
+    if not value:
+        return DEFAULT_BACKFILL_START_DATE
+    try:
+        dateutil.parser.parse(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ConfigError(f"GARMIN_BACKFILL_START_DATE is not a parseable date: {value!r}") from exc
+    return value
+
+
 def settings_from_env(env: Mapping[str, str] | None = None) -> Settings:
     """Build Settings from ``env`` (defaults to ``os.environ``)."""
     env = os.environ if env is None else env
@@ -116,5 +134,6 @@ def settings_from_env(env: Mapping[str, str] | None = None) -> Settings:
         # The TZ the existing GarminDB corpus was imported under, if it was not the
         # home zone. Without it the skew is learned from the data instead.
         import_tz=_zone_from(env, "GARMIN_IMPORT_TZ"),
+        backfill_start_date=_backfill_start_date_from(env),
         sync_interval_seconds=_sync_interval_from(env),
     )

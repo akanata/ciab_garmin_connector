@@ -72,6 +72,25 @@ def test_home_tz_is_validated_as_a_real_zone() -> None:
     assert settings_from_env({"GARMIN_HOME_TZ": "America/Denver"}).home_tz == "America/Denver"
 
 
+def test_backfill_start_date_defaults_to_garmindbs_example() -> None:
+    assert settings_from_env({}).backfill_start_date == "2019-12-31"
+
+
+def test_backfill_start_date_is_read_from_env() -> None:
+    """A full backfill is ~1s per day per stat, so 2019 means hours on first run.
+    The owner needs to be able to shorten it without editing JSON in a container."""
+    assert (
+        settings_from_env({"GARMIN_BACKFILL_START_DATE": "2025-01-01"}).backfill_start_date
+        == "2025-01-01"
+    )
+
+
+def test_bogus_backfill_start_date_fails_at_startup() -> None:
+    """An unparseable date reaches GarminConnectConfigManager's sys.exit(-1)."""
+    with pytest.raises(ConfigError):
+        settings_from_env({"GARMIN_BACKFILL_START_DATE": "last tuesday-ish"})
+
+
 def test_import_tz_is_read_and_validated() -> None:
     """Names the TZ the GarminDB corpus was imported under, when it was not the
     home zone. Exact, unlike the offset learned from the data."""

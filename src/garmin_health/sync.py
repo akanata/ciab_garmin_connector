@@ -1,0 +1,283 @@
+"""The sync sequence, the background loop, and the status it reports.
+
+This module deliberately imports no ``garmindb``: it drives an :class:`Ingest`
+port, so GarminDB can be swapped for the real Garmin API later, and so the whole
+sequence is testable with no account and no network. ``garmin/ingest.py`` is the
+adapter that actually calls GarminDB.
+
+Two GarminDB behaviours shape the design:
+
+- **Its importers swallow every per-file exception**, so a totally failed sync
+  looks successful. Row counts and ``latest_time`` before and after are the only
+  evidence that anything happened, which is why every report carries both.
+- **A download sleeps a second per day and retries five times with backoff**, so
+  a multi-year backfill runs for tens of minutes and cannot be interrupted
+  mid-call. The loop is therefore cancellable at the phase boundaries, and a
+  cooperative stop flag is passed down so the adapter can bail between stats.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import logging
+from collections.abc import Callable
+from collections.abc import Mapping
+from enum import StrEnum
+from threading import Event
+from typing import Any
+from typing import Protocol
+
+import anyio.to_thread
+import attrs
+
+from garmin_health.auth import GarminAuthenticator
+from garmin_health.auth import LinkState
+from garmin_health.config import Settings
+
+logger = logging.getLogger(__name__)
+
+
+class SyncPhase(StrEnum):
+    DOWNLOAD = "download"
+    IMPORT = "import"
+    ANALYZE = "analyze"
+
+
+@attrs.frozen
+class TableStat:
+    """How much of one table exists, as evidence a sync did something.
+
+    ``latest`` is the ISO form of the stored *naive* value, carried as a string
+    because it is a local wall clock on GarminDB's own clock, not an instant.
+    Converting it is ``TimeZonePolicy``'s job, not the status endpoint's.
+    """
+
+    rows: int
+    latest: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"rows": self.rows, "latest": self.latest}
+
+
+class Ingest(Protocol):
+    """The GarminDB-facing port. Every method is synchronous and blocking."""
+
+    def table_stats(self) -> dict[str, TableStat]: ...
+    def download(self, stop: Event) -> None: ...
+    def import_(self, stop: Event) -> None: ...
+    def analyze(self) -> None: ...
+
+
+@attrs.frozen
+class SyncReport:
+    started_at: dt.datetime
+    finished_at: dt.datetime | None = None
+    phase: SyncPhase | None = None
+    error: str | None = None
+    before: Mapping[str, TableStat] = attrs.field(factory=dict)
+    after: Mapping[str, TableStat] = attrs.field(factory=dict)
+
+    @property
+    def duration_seconds(self) -> float | None:
+        if self.finished_at is None:
+            return None
+        return (self.finished_at - self.started_at).total_seconds()
+
+    @property
+    def row_delta(self) -> dict[str, int]:
+        return {
+            name: stat.rows - self.before.get(name, TableStat(rows=0)).rows
+            for name, stat in self.after.items()
+        }
+
+    @property
+    def changed(self) -> bool:
+        """False is not necessarily a failure -- an up-to-date corpus changes
+        nothing -- but combined with a clean error it is the only way to notice
+        that every file silently failed to import."""
+        return any(delta != 0 for delta in self.row_delta.values())
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "started_at": self.started_at.isoformat(),
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "duration_seconds": self.duration_seconds,
+            "phase": self.phase.value if self.phase else None,
+            "error": self.error,
+            "changed": self.changed,
+            "row_delta": self.row_delta,
+            "tables": {name: stat.as_dict() for name, stat in self.after.items()},
+        }
+
+
+def incremental_range(
+    *,
+    latest: dt.datetime | dt.date | None,
+    today: dt.date,
+    fallback: tuple[dt.date, int],
+) -> tuple[dt.date, int]:
+    """GarminDB's own incremental rule, from ``garmindb_cli.py``'s ``__get_date_and_days``.
+
+    Start one day *before* the newest row, because the last download may have
+    captured a partial day. With no rows at all, fall back to the configured
+    ``<stat>_start_date``. This is what makes routine syncs cheap.
+    """
+    if latest is None:
+        return fallback
+    latest_date = latest.date() if isinstance(latest, dt.datetime) else latest
+    start = latest_date - dt.timedelta(days=1)
+    # Clamped: a clock skew or a future-dated row must not ask Garmin for a
+    # negative span, which Download would loop over zero times but report oddly.
+    return start, max((today - start).days, 0)
+
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
+
+
+class SyncEngine:
+    """Owns the sync lock, the last report, and the interval loop."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        authenticator: GarminAuthenticator,
+        ingest_factory: Callable[[], Ingest],
+        clock: Callable[[], dt.datetime] = _utcnow,
+    ) -> None:
+        self._settings = settings
+        self._auth = authenticator
+        self._ingest_factory = ingest_factory
+        self._clock = clock
+        self._lock = asyncio.Lock()
+        self._stop = Event()
+        self._last: SyncReport | None = None
+        self._task: asyncio.Task[SyncReport | None] | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return self._lock.locked()
+
+    def request_stop(self) -> None:
+        """Ask an in-flight sync to stop at its next phase or stat boundary."""
+        self._stop.set()
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "link_state": self._auth.status().state.value,
+            "running": self.is_running,
+            "interval_seconds": self._settings.sync_interval_seconds,
+            "last_sync": self._last.as_dict() if self._last else None,
+        }
+
+    async def trigger(self) -> bool:
+        """Start a sync in the background. False if one is already in flight."""
+        if self.is_running:
+            return False
+        self._task = asyncio.create_task(self.run_once())
+        self._task.add_done_callback(self._log_task_result)
+        # Let the task reach its first await so is_running is true on return,
+        # which is what makes a second POST /sync see the in-flight run.
+        await asyncio.sleep(0)
+        return True
+
+    async def wait_for_idle(self) -> None:
+        """Test and shutdown helper: await the backgrounded run, if any."""
+        if self._task is not None:
+            await asyncio.shield(self._task)
+
+    @staticmethod
+    def _log_task_result(task: asyncio.Task[SyncReport | None]) -> None:
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:  # pragma: no cover - run_once catches its own
+            logger.error("Background sync task failed: %s", exception)
+
+    async def run_once(self) -> SyncReport | None:
+        """Run one download -> import -> analyze cycle.
+
+        Returns ``None`` if the account is not linked or a sync is already running.
+        Phase failures are recorded on the report rather than raised: the caller is
+        a background loop or a fire-and-forget endpoint, and neither can do
+        anything useful with an exception.
+        """
+        if self._auth.status().state is not LinkState.LINKED:
+            logger.info("Skipping sync: the Garmin account is not linked.")
+            return None
+        if self.is_running:
+            logger.info("Skipping sync: one is already in flight.")
+            return None
+
+        async with self._lock:
+            self._stop.clear()
+            ingest = self._ingest_factory()
+            started = self._clock()
+            phase: SyncPhase | None = None
+            error: str | None = None
+            before: dict[str, TableStat] = {}
+            after: dict[str, TableStat] = {}
+
+            try:
+                before = await self._in_thread(ingest.table_stats)
+                phase = SyncPhase.DOWNLOAD
+                await self._in_thread(ingest.download, self._stop)
+                phase = SyncPhase.IMPORT
+                await self._in_thread(ingest.import_, self._stop)
+                phase = SyncPhase.ANALYZE
+                await self._in_thread(ingest.analyze)
+                phase = None
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                logger.exception("Sync failed during %s", phase)
+
+            try:
+                after = await self._in_thread(ingest.table_stats)
+            except Exception as exc:
+                logger.warning("Could not read table stats after the sync: %s", exc)
+                after = dict(before)
+
+            report = SyncReport(
+                started_at=started,
+                finished_at=self._clock(),
+                phase=phase,
+                error=error,
+                before=before,
+                after=after,
+            )
+            self._last = report
+            if error is None and not report.changed:
+                logger.warning(
+                    "Sync reported success but no table grew. GarminDB's importers swallow "
+                    "per-file errors, so verify the corpus if this repeats: %s",
+                    report.row_delta,
+                )
+            return report
+
+    @staticmethod
+    async def _in_thread(func: Callable[..., Any], *args: Any) -> Any:
+        # abandon_on_cancel: a download blocks in time.sleep for minutes and cannot
+        # be interrupted, so shutdown must not wait for it. The process is going
+        # away; GarminDB commits per file, and a partial corpus is re-importable
+        # from the retained JSON/FIT files without re-downloading.
+        return await anyio.to_thread.run_sync(func, *args, abandon_on_cancel=True)
+
+    async def run_forever(self) -> None:
+        """Sleep, sync, repeat. Cancelled by the app lifespan.
+
+        Sleeping first is deliberate: a crash-looping container would otherwise
+        replay a Garmin sign-in on every restart.
+        """
+        logger.info("Sync loop started; interval %ss.", self._settings.sync_interval_seconds)
+        while True:
+            await asyncio.sleep(self._settings.sync_interval_seconds)
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # run_once records its own failures; this is belt and braces so a
+                # bug in the reporting path cannot kill the loop for good.
+                logger.exception("Unexpected error in the sync loop; continuing.")

@@ -21,10 +21,6 @@ from garmindb import GarminConnectConfigManager
 
 from garmin_health.config import Settings
 
-# Matches GarminDB's own example. Only ever used for the first sync of a stat; every
-# later run starts one day before that table's latest_time().
-DEFAULT_BACKFILL_START_DATE = "2019-12-31"
-
 REQUIRED_SECTIONS = ("db", "garmin", "credentials", "data", "directories", "enabled_stats")
 
 
@@ -49,11 +45,11 @@ def render_config(settings: Settings, *, user: str = "") -> dict[str, Any]:
             "password_file": None,
         },
         "data": {
-            "sleep_start_date": DEFAULT_BACKFILL_START_DATE,
-            "monitoring_start_date": DEFAULT_BACKFILL_START_DATE,
-            "rhr_start_date": DEFAULT_BACKFILL_START_DATE,
-            "hrv_start_date": DEFAULT_BACKFILL_START_DATE,
-            "weight_start_date": DEFAULT_BACKFILL_START_DATE,
+            "sleep_start_date": settings.backfill_start_date,
+            "monitoring_start_date": settings.backfill_start_date,
+            "rhr_start_date": settings.backfill_start_date,
+            "hrv_start_date": settings.backfill_start_date,
+            "weight_start_date": settings.backfill_start_date,
             "download_latest_activities": 0,
             "download_all_activities": 0,
         },
