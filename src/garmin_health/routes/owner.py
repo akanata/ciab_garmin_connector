@@ -76,6 +76,20 @@ def _describe_last_sync(engine: SyncEngine) -> str:
     return f"Last sync finished at {when} ({rows} rows held)."
 
 
+def _serving_fault(state: State) -> str | None:
+    """The serving layer's fault, if it has one.
+
+    Sync health and serving health fail independently: a corpus can be perfectly
+    fresh and still be unservable because its schema needs rebuilding. That is a
+    fault only the owner can clear, so it has to appear where the owner looks.
+    """
+    service = state.get("health_service")
+    if service is None:
+        return None
+    fault: str | None = service.connection.fault
+    return fault
+
+
 # Progressive enhancement only. The plain form POST is what submits; this just
 # reports that the (multi-second, real) Garmin SSO round-trip is under way. If a
 # CSP blocks the inline script, linking still works with no feedback.
@@ -128,7 +142,12 @@ def _button(label: str) -> str:
     return f"<button type='submit'><span class='spinner' aria-hidden='true'></span>{escape(label)}</button>"
 
 
-def _render(status: AuthStatus, error: str | None = None, sync_summary: str = "") -> str:
+def _render(
+    status: AuthStatus,
+    error: str | None = None,
+    sync_summary: str = "",
+    serving_fault: str | None = None,
+) -> str:
     email = escape(status.email or "", quote=True)
 
     if status.state is LinkState.LINKED:
@@ -148,6 +167,18 @@ def _render(status: AuthStatus, error: str | None = None, sync_summary: str = ""
         body.append(f"<p class='error' role='alert'>{escape(error)}</p>")
     if status.detail:
         body.append(f"<p class='detail'>{escape(status.detail)}</p>")
+    if serving_fault:
+        # Offered only while there is actually a fault: a destructive action
+        # should not sit on the page when nothing is wrong.
+        body.append(
+            f"<p class='detail'>{escape(serving_fault)}</p>"
+            "<form method='post' action='/rebuild' data-busy='Rebuilding the databases...'>"
+            + _button("Rebuild the local databases")
+            + "</form>"
+            "<p class='note'>This deletes the local databases and rebuilds them from the health "
+            "data already downloaded. Nothing is re-downloaded from Garmin, and no health data is "
+            "lost, but it can take several minutes.</p>"
+        )
 
     if status.state is LinkState.AWAITING_MFA:
         body.append(
@@ -204,6 +235,7 @@ def setup_page(state: State) -> str:
         authenticator.status(),
         authenticator.take_error(),
         _describe_last_sync(_sync_engine(state)),
+        _serving_fault(state),
     )
 
 
@@ -266,9 +298,33 @@ async def trigger_sync(state: State) -> dict[str, object]:
     }
 
 
-@get("/sync/status", sync_to_thread=False)
+@post("/rebuild", status_code=HTTP_202_ACCEPTED)
+async def trigger_rebuild(state: State) -> dict[str, object]:
+    """Delete and reimport the local databases. Returns immediately.
+
+    Deliberately not gated on the account being linked: a rebuild touches nothing
+    but local files, and refusing it while unlinked would strand a container whose
+    corpus is broken and whose token has since expired.
+    """
+    started = await _sync_engine(state).trigger_rebuild()
+    return {
+        "started": started,
+        "detail": "Rebuild started." if started else "A sync or rebuild is already running.",
+    }
+
+
+@get("/sync/status", sync_to_thread=True)
 def sync_status(state: State) -> dict[str, object]:
-    return _sync_engine(state).status()
+    """Sync state plus the serving layer's own health.
+
+    The two fail independently: a corpus can be perfectly fresh and still be
+    unservable because its schema needs rebuilding, and that is a fault only the
+    owner can clear -- so it has to be visible somewhere the owner looks.
+    """
+    status: dict[str, object] = _sync_engine(state).status()
+    service = state.get("health_service")
+    status["serving"] = service.status() if service is not None else {"available": False}
+    return status
 
 
 owner_router = Router(
@@ -280,6 +336,7 @@ owner_router = Router(
         submit_mfa,
         unlink,
         trigger_sync,
+        trigger_rebuild,
         sync_status,
     ],
     guards=[owner_guard],

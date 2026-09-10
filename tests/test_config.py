@@ -3,6 +3,10 @@ from pathlib import Path
 import pytest
 from garmindb import GarminConnectConfigManager
 
+from garmin_health.config import DEFAULT_LIMIT
+from garmin_health.config import MAX_LIMIT
+from garmin_health.config import MAX_ROWS_SCANNED
+from garmin_health.config import MAX_SESSION_SUBSERIES
 from garmin_health.config import ConfigError
 from garmin_health.config import Settings
 from garmin_health.config import settings_from_env
@@ -108,3 +112,44 @@ def test_bogus_home_tz_fails_at_startup_rather_than_silently() -> None:
     for months, so an unresolvable zone must fail loudly here."""
     with pytest.raises(ConfigError):
         settings_from_env({"GARMIN_HOME_TZ": "Mars/Olympus_Mons"})
+
+
+def test_db_dir_is_where_garmindb_puts_its_sqlite_files(settings: Settings) -> None:
+    """GarminConnectConfigManager.get_db_dir() is <base_dir>/DBs. The serving side
+    derives it directly so it never has to render or read the GarminDB config."""
+    assert settings.db_dir == settings.health_data_dir / "DBs"
+
+
+def test_serving_limits_have_the_documented_defaults() -> None:
+    assert (DEFAULT_LIMIT, MAX_LIMIT, MAX_ROWS_SCANNED) == (5_000, 50_000, 1_000_000)
+    assert MAX_SESSION_SUBSERIES == 2_000
+
+
+def test_stage_gap_filling_is_off_by_default() -> None:
+    """A gap means Garmin recorded nothing; UNKNOWN filler would be invented data."""
+    assert settings_from_env({}).fill_stage_gaps is False
+    assert settings_from_env({"GARMIN_FILL_STAGE_GAPS": "true"}).fill_stage_gaps is True
+
+
+def test_restless_period_derivation_is_off_by_default() -> None:
+    """Oura's restless_periods is movement-derived, not an awakening count. Serving
+    a Garmin awakening count under that id would corrupt a merged list."""
+    assert settings_from_env({}).derive_restless_periods is False
+    assert (
+        settings_from_env({"GARMIN_DERIVE_RESTLESS_PERIODS": "1"}).derive_restless_periods is True
+    )
+
+
+@pytest.mark.parametrize("raw", ["true", "TRUE", "1", "yes", "on"])
+def test_truthy_flag_spellings_are_all_accepted(raw: str) -> None:
+    assert settings_from_env({"GARMIN_FILL_STAGE_GAPS": raw}).fill_stage_gaps is True
+
+
+@pytest.mark.parametrize("raw", ["false", "0", "no", "off", ""])
+def test_falsy_flag_spellings_are_all_rejected(raw: str) -> None:
+    assert settings_from_env({"GARMIN_FILL_STAGE_GAPS": raw}).fill_stage_gaps is False
+
+
+def test_a_nonsense_flag_value_fails_loudly() -> None:
+    with pytest.raises(ConfigError):
+        settings_from_env({"GARMIN_FILL_STAGE_GAPS": "maybe"})

@@ -78,6 +78,6 @@ follow_untyped_imports = true
 # call into them a strict-mode "untyped call" error; they are Any at the boundary
 # instead. health_data_service keeps follow_untyped_imports, which is why it is on.
 [[tool.mypy.overrides]]
-module = ["garmindb.*", "garminconnect.*", "dateutil.*", "idbutils.*"]
+module = ["garmindb.*", "garminconnect.*", "dateutil.*", "idbutils.*", "fitfile.*"]
 follow_untyped_imports = false
 ignore_missing_imports = true

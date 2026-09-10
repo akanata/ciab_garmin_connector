@@ -18,6 +18,7 @@ from threading import Event
 from typing import Any
 
 import attrs
+import fitfile.units
 from garmindb import Analyze
 from garmindb import Download
 from garmindb import GarminHrvData
@@ -103,10 +104,31 @@ class GarminDbIngest:
         # MonitoringFitFileProcessor.write_file dereferences plugin_manager
         # unconditionally, so None raises AttributeError partway through an import.
         self.plugin_manager = PluginManager(self._config.get_plugins_dir(), self._db_params)
-        # Constructing a DB runs create_all plus a version check -- it is a write,
-        # and it is also what installs cls.time_col on every table class.
-        self._garmin_db = GarminDb(self._db_params)
-        self._monitoring_db = MonitoringDb(self._db_params)
+        self._handles: tuple[Any, Any] | None = None
+
+    # -- database handles -----------------------------------------------------
+
+    @property
+    def _dbs(self) -> tuple[Any, Any]:
+        """The two DB objects, built on first use.
+
+        Constructing a DB runs create_all plus a version check -- it is a write,
+        and it is also what installs ``cls.time_col`` on every table class. It is
+        deliberately NOT done in ``__init__``: a stale schema raises there, and
+        ``rebuild()`` has to be able to exist in order to delete the very files
+        that are raising.
+        """
+        if self._handles is None:
+            self._handles = (GarminDb(self._db_params), MonitoringDb(self._db_params))
+        return self._handles
+
+    @property
+    def _garmin_db(self) -> Any:
+        return self._dbs[0]
+
+    @property
+    def _monitoring_db(self) -> Any:
+        return self._dbs[1]
 
     # -- evidence -------------------------------------------------------------
 
@@ -230,8 +252,12 @@ class GarminDbIngest:
             logger.warning("Could not read measurement_system (%s); importing without it.", exc)
             return None
 
-    def import_(self, stop: Event) -> None:
-        """Import the downloaded files, profile first."""
+    def import_(self, stop: Event, *, latest: bool = IMPORT_LATEST) -> None:
+        """Import the downloaded files, profile first.
+
+        ``latest=False`` reimports the whole retained corpus rather than the last
+        24 hours of it, which is what a rebuild needs.
+        """
         fit_dir = self._config.get_fit_files_dir()
         monitoring_dir = self._config.get_monitoring_base_dir()
         dbp = self._db_params
@@ -255,22 +281,20 @@ class GarminDbIngest:
         if stop.is_set():
             return
         self._process(
-            self._bindings.summary(dbp, monitoring_dir, IMPORT_LATEST, measurement_system, DEBUG)
+            self._bindings.summary(dbp, monitoring_dir, latest, measurement_system, DEBUG)
         )
         self._process(
-            self._bindings.hydration(dbp, monitoring_dir, IMPORT_LATEST, measurement_system, DEBUG)
+            self._bindings.hydration(dbp, monitoring_dir, latest, measurement_system, DEBUG)
         )
         self._process(
-            self._bindings.monitoring_fit(monitoring_dir, IMPORT_LATEST, measurement_system, DEBUG),
+            self._bindings.monitoring_fit(monitoring_dir, latest, measurement_system, DEBUG),
             self._bindings.monitoring_processor(dbp, self.plugin_manager, DEBUG),
         )
 
         if stop.is_set():
             return
         # Prefer Garmin Connect's JSON; fall back to FIT sleep files when there is none.
-        sleep_json = self._bindings.sleep_json(
-            dbp, self._config.get_sleep_dir(), IMPORT_LATEST, DEBUG
-        )
+        sleep_json = self._bindings.sleep_json(dbp, self._config.get_sleep_dir(), latest, DEBUG)
         if sleep_json.file_count() > 0:
             sleep_json.process()
         else:
@@ -284,14 +308,68 @@ class GarminDbIngest:
         if stop.is_set():
             return
         rhr_dir = self._config.get_rhr_dir()
-        self._process(self._bindings.rhr(dbp, rhr_dir, IMPORT_LATEST, DEBUG))
+        self._process(self._bindings.rhr(dbp, rhr_dir, latest, DEBUG))
         # HRV tends to land in the same place as RHR.
-        self._process(self._bindings.hrv(dbp, rhr_dir, IMPORT_LATEST, DEBUG))
+        self._process(self._bindings.hrv(dbp, rhr_dir, latest, DEBUG))
+
+    # -- rebuild --------------------------------------------------------------
+
+    def rebuild(self, stop: Event) -> None:
+        """Delete both SQLite files and reimport the whole retained corpus.
+
+        The owner's way out of a schema mismatch. There is no download: persisting
+        the raw JSON/FIT tree is exactly what makes this a local reimport instead
+        of hours of re-fetching.
+
+        The order matters. The files are deleted *before* any DB object is
+        constructed, because constructing one against the stale schema is what
+        raises in the first place; afterwards ``create_all`` builds the current
+        schema from nothing. Any handle this adapter already cached would point at
+        the deleted inode, so it is dropped too.
+        """
+        logger.warning("Rebuilding the GarminDB databases in %s.", self._db_params.db_path)
+        self._handles = None
+        GarminDb.delete_db(self._db_params)
+        MonitoringDb.delete_db(self._db_params)
+        self.import_(stop, latest=False)
+        if stop.is_set():
+            logger.warning("Stop requested during the rebuild; skipping the analyze phase.")
+            return
+        self.analyze()
 
     # -- analyze --------------------------------------------------------------
 
+    def _can_analyze(self) -> bool:
+        """Whether ``Analyze()`` can be constructed at all.
+
+        ``Analyze.__init__`` ends with ``unit_strings[measurements_type(garmin_db)]``,
+        and ``measurements_type`` returns an **unhashable** ``UnknownEnumValue``
+        when the ``attributes`` row is missing -- so the lookup raises a bare
+        ``TypeError``, not a ``KeyError``. The row only exists once a profile
+        import has succeeded, which is exactly what a freshly rebuilt database has
+        not necessarily had yet.
+        """
+        system = self._measurement_system()
+        try:
+            return system in fitfile.units.unit_strings
+        except TypeError:
+            return False
+
     def analyze(self) -> None:
-        """Build the summary tables and dynamic views."""
+        """Build the summary tables and dynamic views.
+
+        Skipped rather than fatal when the measurement system is unknown: analyze
+        only builds summary tables and views, none of which the serving layer
+        reads, so losing it degrades nothing we serve -- whereas letting it raise
+        would turn an otherwise complete sync or rebuild into a reported failure.
+        """
+        if not self._can_analyze():
+            logger.warning(
+                "Skipping the analyze phase: attributes.measurement_system is not set yet, and "
+                "Analyze() cannot be constructed without it. It will run on the next sync once a "
+                "profile import has succeeded."
+            )
+            return
         analyze = self._bindings.analyze(self._config, DEBUG)
         analyze.summary()
         analyze.create_dynamic_views()

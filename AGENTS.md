@@ -25,19 +25,38 @@ run the underlying `uv run …` commands), the Garmin auth flow (`config.py`,
 `requirements.txt` is gone; dependencies live in `pyproject.toml` and are pinned
 by `uv.lock`.
 
-**Not built yet:** the serving layer (`registry.py`, `service.py`,
-`garmin/connection.py` and the other `garmin/*` modules, `routes/service.py`).
-`/v1/*` therefore 404s today even though `openhost.toml` already advertises the
-service — which is safe, because the spec's client treats any non-200 from a
-provider as "this provider has nothing".
+**Landed — plan.md Part 4, the serving layer:** `serialization.py`,
+`registry.py`, `service.py`, `routes/service.py`, and
+`garmin/{connection,sampling,vocabulary,heart_rate,daily,sleep}.py`. `/v1/metrics`,
+`/v1/time-series` and `/v1/sleep-sessions` serve real data; `/v1/workouts` is an
+empty `{"data": []}` and `/v1/workouts/{id}` a 404, both deliberately.
+`resolve_policy()` is now called once at boot by `garmin/connection.py`, and
+again on every `GarminConnection.reset()`.
 
-`resolve_policy()` is implemented and tested but **not yet wired into startup**:
-`garmin/connection.py` (§4a) is what should call it once, at boot.
+Four metrics are served: `heart_rate`, `hrv_rmssd`, `sleep_score`,
+`readiness_resting_heart_rate`. `registry.py`'s docstring records which spec
+metrics are deliberately *not* served, and why — read it before adding one.
+
+**Also landed alongside Part 4:** `POST /rebuild` (owner-only), which deletes the
+SQLite files and reimports the retained JSON/FIT corpus with `latest=False`. It
+is the owner's only way out of a schema mismatch in a container, and it never
+re-downloads. `/setup` shows the fault and the button only while there is one;
+`GET /sync/status` grew a `serving` block.
+
+**Not built yet:** workouts, body battery (`daily_summary.bb_*`, available but
+with no spec type — it would go under vendor-extension metric ids), and any
+push/webhook ingest. There is still no full-reimport endpoint *other* than
+`/rebuild`, which is a heavier hammer than a per-file retry.
 
 **Environment knobs:** `GARMIN_HOME_TZ`, `GARMIN_IMPORT_TZ`,
 `GARMIN_BACKFILL_START_DATE` (default `2019-12-31`; a full backfill is roughly
 one second per day *per stat*, so the default is hours on first run),
-`SYNC_INTERVAL_SECONDS` (default 6h), `GARMIN_DOMAIN`, `BOTTLE_APP_DATA_DIR`.
+`SYNC_INTERVAL_SECONDS` (default 6h), `GARMIN_DOMAIN`, `BOTTLE_APP_DATA_DIR`,
+`GARMIN_FILL_STAGE_GAPS` and `GARMIN_DERIVE_RESTLESS_PERIODS` (both default
+false; both make the service emit data Garmin did not record, so leave them off
+unless a specific consumer needs them). Serving limits are constants in
+`config.py`: `DEFAULT_LIMIT` 5 000, `MAX_LIMIT` 50 000, `MAX_ROWS_SCANNED`
+1 000 000, `MAX_SESSION_SUBSERIES` 2 000.
 
 ## Important References
 
@@ -140,6 +159,27 @@ imported only by `garmin/*`.
   `sleep.start`, because `day` and `sleep_events` are both on the home clock —
   so the search window does not move with the very offset being learned.
 
+**Serving.**
+
+- `GarminConnection` is opened once in a lifespan hook and reset (never
+  reconstructed by a crash) thereafter. Every read goes through `conn.read()`,
+  which retries **exactly once** on `OperationalError` after a `reset()`.
+- The two degraded states are different and must not be conflated. *No timezone
+  and no data* is a never-synced container: serve empty, 200. *No timezone but
+  data present* is a misconfiguration: 503, because serving those rows on the
+  container's local clock is a silent hours-wide error. `service.py` draws that
+  line; nothing else should.
+- `/health` stays 200 through every degraded state. Failing it makes the router
+  restart-loop the container the owner has to visit to fix the problem.
+- Day-keyed samples (`sleep_score`, `readiness_resting_heart_rate`) convert local
+  midnight through the same `to_utc` as everything else, so a Denver day is
+  `T06:00Z`/`T07:00Z` rather than `00:00Z`. A consumer bucketing by *UTC* date is
+  therefore off by one in western zones — inherent, since the spec has no
+  date-valued sample type.
+- `limit` means **even decimation across the requested window**, preserving the
+  first and last readings. Never most-recent-N: that silently discards the
+  `start` the consumer explicitly passed.
+
 **Spec conformance.**
 
 - Construct spec types with **keyword arguments only**. attrs moves overridden
@@ -186,6 +226,24 @@ imported only by `garmin/*`.
 - `download_days_overlap` is a hardcoded class attribute on `Download` (`3`),
   **not** read from config — `gc_config.download_days_overlap()` returns `None`
   with our config and is simply unused. Do not "fix" it.
+- **plan.md §4b's `selectable=(table.time_col, column)` does not work.**
+  `DbObject._s_query` hands its `selectable` to `session.query()` as a *single*
+  entity, and SQLAlchemy 2.0 raises `ArgumentError` on a tuple there.
+  `garmin/sampling.py`'s `period_rows`/`period_count` build the same query from
+  `DbObject`'s public `during`/`after`/`before` expressions instead — still no
+  raw SQL, still lightweight `Row` tuples rather than ORM instances.
+- **`Analyze()` cannot be constructed until `attributes.measurement_system`
+  exists.** Its `__init__` ends with `unit_strings[measurements_type(garmin_db)]`,
+  and `measurements_type` returns an **unhashable** `UnknownEnumValue` when the
+  row is missing — so that lookup raises a bare `TypeError`, not a `KeyError`.
+  `ingest.analyze()` checks the precondition and skips with a warning: analyze
+  only builds summary tables and views, none of which the serving layer reads, so
+  skipping degrades nothing we serve, whereas raising would turn an otherwise
+  complete sync into a reported failure. It is reachable in production right
+  after a `/rebuild` on a corpus with no profile files.
+- `GarminDbIngest` builds its DB handles **lazily**, precisely so that a corpus
+  whose schema is too old to open can still be constructed — `rebuild()` has to
+  exist in order to delete the files that would otherwise raise.
 
 **Sync.**
 

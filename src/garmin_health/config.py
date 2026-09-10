@@ -17,6 +17,24 @@ DEFAULT_SYNC_INTERVAL_SECONDS = 6 * 60 * 60
 DEFAULT_BACKFILL_START_DATE = "2019-12-31"
 SUPPORTED_DOMAINS = ("garmin.com", "garmin.cn")
 
+# Serving limits. monitoring_hr is ~720 rows/day, so a year is ~263k rows and an
+# unbounded request would build that many Sample objects.
+#
+# DEFAULT_LIMIT applies when the consumer sent no limit at all, so an unbounded
+# request cannot exhaust memory. MAX_LIMIT is generous enough that a full day
+# (720 rows) is never decimated in practice. MAX_ROWS_SCANNED bounds the *fetch*
+# rather than the response, and is what turns a decade-wide window into a 413
+# instead of a swap storm.
+DEFAULT_LIMIT = 5_000
+MAX_LIMIT = 50_000
+MAX_ROWS_SCANNED = 1_000_000
+# An 8-hour night is ~240 heart-rate and ~96 HRV rows, so this only ever bites on
+# a corrupt window; it exists so one bad row cannot make a session unbounded.
+MAX_SESSION_SUBSERIES = 2_000
+
+_TRUE = frozenset({"1", "true", "yes", "on"})
+_FALSE = frozenset({"0", "false", "no", "off", ""})
+
 
 class ConfigError(Exception):
     """The environment does not describe a runnable configuration."""
@@ -38,6 +56,10 @@ class Settings:
     import_tz: str | None = None
     backfill_start_date: str = DEFAULT_BACKFILL_START_DATE
     sync_interval_seconds: int = DEFAULT_SYNC_INTERVAL_SECONDS
+    # Both default off because both would emit data Garmin never recorded. See
+    # the sleep builder for what each one invents when switched on.
+    fill_stage_gaps: bool = False
+    derive_restless_periods: bool = False
 
     @property
     def config_dir(self) -> Path:
@@ -57,6 +79,17 @@ class Settings:
     def health_data_dir(self) -> Path:
         """GarminDB's base_dir: the raw JSON/FIT corpus plus the SQLite DBs."""
         return self.app_data_dir / "HealthData"
+
+    @property
+    def db_dir(self) -> Path:
+        """The GarminDB SQLite files.
+
+        Exactly what ``GarminConnectConfigManager.get_db_dir()`` returns for our
+        config. Derived directly so the serving side never has to render or read
+        GarminConnectConfig.json, and therefore works on a container that has
+        never linked an account.
+        """
+        return self.health_data_dir / "DBs"
 
     @property
     def is_cn(self) -> bool:
@@ -82,6 +115,20 @@ def _sync_interval_from(env: Mapping[str, str]) -> int:
     if seconds <= 0:
         raise ConfigError(f"SYNC_INTERVAL_SECONDS must be positive, got {seconds}")
     return seconds
+
+
+def _flag_from(env: Mapping[str, str], name: str) -> bool:
+    """Parse a boolean knob. An unrecognised spelling is an error, not a False.
+
+    Silently reading "maybe" as off would leave the owner believing they had
+    switched something on.
+    """
+    raw = env.get(name, "").strip().lower()
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    raise ConfigError(f"{name} must be a boolean (true/false), got {env[name]!r}")
 
 
 def _zone_from(env: Mapping[str, str], name: str) -> str | None:
@@ -136,4 +183,6 @@ def settings_from_env(env: Mapping[str, str] | None = None) -> Settings:
         import_tz=_zone_from(env, "GARMIN_IMPORT_TZ"),
         backfill_start_date=_backfill_start_date_from(env),
         sync_interval_seconds=_sync_interval_from(env),
+        fill_stage_gaps=_flag_from(env, "GARMIN_FILL_STAGE_GAPS"),
+        derive_restless_periods=_flag_from(env, "GARMIN_DERIVE_RESTLESS_PERIODS"),
     )

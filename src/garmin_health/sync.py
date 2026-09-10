@@ -42,6 +42,7 @@ class SyncPhase(StrEnum):
     DOWNLOAD = "download"
     IMPORT = "import"
     ANALYZE = "analyze"
+    REBUILD = "rebuild"
 
 
 @attrs.frozen
@@ -67,6 +68,7 @@ class Ingest(Protocol):
     def download(self, stop: Event) -> None: ...
     def import_(self, stop: Event) -> None: ...
     def analyze(self) -> None: ...
+    def rebuild(self, stop: Event) -> None: ...
 
 
 @attrs.frozen
@@ -146,11 +148,18 @@ class SyncEngine:
         authenticator: GarminAuthenticator,
         ingest_factory: Callable[[], Ingest],
         clock: Callable[[], dt.datetime] = _utcnow,
+        on_corpus_changed: Callable[[], None] | None = None,
     ) -> None:
         self._settings = settings
         self._auth = authenticator
         self._ingest_factory = ingest_factory
         self._clock = clock
+        # Called once after each completed sync, whatever the outcome. The serving
+        # layer uses it to drop pooled handles that may now point at a deleted
+        # inode, and to retry a timezone that could only be resolved once the
+        # profile importers had run. Deliberately a bare callable: sync.py imports
+        # no garmindb, and that is what keeps this whole sequence testable.
+        self._on_corpus_changed = on_corpus_changed
         self._lock = asyncio.Lock()
         self._stop = Event()
         self._last: SyncReport | None = None
@@ -180,6 +189,15 @@ class SyncEngine:
         self._task.add_done_callback(self._log_task_result)
         # Let the task reach its first await so is_running is true on return,
         # which is what makes a second POST /sync see the in-flight run.
+        await asyncio.sleep(0)
+        return True
+
+    async def trigger_rebuild(self) -> bool:
+        """Start a rebuild in the background. False if anything is already running."""
+        if self.is_running:
+            return False
+        self._task = asyncio.create_task(self.rebuild_once())
+        self._task.add_done_callback(self._log_task_result)
         await asyncio.sleep(0)
         return True
 
@@ -248,6 +266,7 @@ class SyncEngine:
                 after=after,
             )
             self._last = report
+            self._notify_corpus_changed()
             if error is None and not report.changed:
                 logger.warning(
                     "Sync reported success but no table grew. GarminDB's importers swallow "
@@ -255,6 +274,74 @@ class SyncEngine:
                     report.row_delta,
                 )
             return report
+
+    async def rebuild_once(self) -> SyncReport | None:
+        """Rebuild the local databases from the retained JSON/FIT corpus.
+
+        This is the owner's way out of a schema mismatch, which is otherwise a dead
+        end in a container: the DB files are the problem, and nothing else can
+        delete them. Deliberately **no download phase** -- persisting the raw
+        corpus is exactly what makes a rebuild a local reimport of minutes rather
+        than hours of re-downloading.
+
+        It also needs no linked account, because it touches nothing but local
+        files. Refusing while unlinked would strand a container whose corpus is
+        broken and whose token has since expired.
+        """
+        if self.is_running:
+            logger.info("Skipping rebuild: a sync or rebuild is already in flight.")
+            return None
+
+        async with self._lock:
+            self._stop.clear()
+            started = self._clock()
+            phase: SyncPhase | None = SyncPhase.REBUILD
+            error: str | None = None
+            before: dict[str, TableStat] = {}
+            after: dict[str, TableStat] = {}
+
+            try:
+                ingest = self._ingest_factory()
+                before = await self._in_thread(ingest.table_stats)
+            except Exception as exc:
+                # Expected when the schema is broken -- which is the whole reason
+                # to be here -- so it must not stop the rebuild.
+                logger.info("Could not read table stats before the rebuild: %s", exc)
+                ingest = self._ingest_factory()
+
+            try:
+                await self._in_thread(ingest.rebuild, self._stop)
+                phase = None
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                logger.exception("Rebuild failed")
+
+            try:
+                after = await self._in_thread(ingest.table_stats)
+            except Exception as exc:
+                logger.warning("Could not read table stats after the rebuild: %s", exc)
+                after = dict(before)
+
+            report = SyncReport(
+                started_at=started,
+                finished_at=self._clock(),
+                phase=phase,
+                error=error,
+                before=before,
+                after=after,
+            )
+            self._last = report
+            self._notify_corpus_changed()
+            return report
+
+    def _notify_corpus_changed(self) -> None:
+        """A failing callback must never turn a good sync into a failed one."""
+        if self._on_corpus_changed is None:
+            return
+        try:
+            self._on_corpus_changed()
+        except Exception:
+            logger.exception("The post-sync corpus callback failed; continuing.")
 
     @staticmethod
     async def _in_thread(func: Callable[..., Any], *args: Any) -> Any:

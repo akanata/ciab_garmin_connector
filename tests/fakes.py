@@ -154,3 +154,7 @@ class FakeIngest:
 
     def analyze(self) -> None:
         self._record("analyze")
+
+    def rebuild(self, stop: Any) -> None:
+        self.stop_event = stop
+        self._record("rebuild")

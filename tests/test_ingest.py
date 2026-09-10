@@ -7,10 +7,13 @@ the sequence, the incremental ranges and the pitfalls can all be asserted.
 from __future__ import annotations
 
 import datetime as dt
+import logging
+import sqlite3
 from pathlib import Path
 from threading import Event
 
 import pytest
+from garmindb.garmindb import Attributes
 
 from garmin_health.config import Settings
 from garmin_health.garmin.ingest import Bindings
@@ -261,11 +264,38 @@ class TestImport:
         assert log == []
 
 
+def plant_measurement_system(ingest: GarminDbIngest, value: str = "metric") -> None:
+    """What a successful profile import leaves behind.
+
+    Analyze() cannot be constructed without it: measurements_type returns an
+    UNHASHABLE UnknownEnumValue when the row is missing, and Analyze.__init__
+    indexes unit_strings with it.
+    """
+    Attributes.set(ingest._garmin_db, "measurement_system", value)
+
+
 class TestAnalyze:
     def test_summarises_then_creates_views(self, tmp_path: Path) -> None:
         log: list[str] = []
-        make_ingest(tmp_path, log=log).analyze()
+        ingest = make_ingest(tmp_path, log=log)
+        plant_measurement_system(ingest)
+        ingest.analyze()
         assert log == ["summary", "create_dynamic_views"]
+
+    def test_it_is_skipped_rather_than_fatal_with_no_measurement_system(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Analyze.__init__ ends with unit_strings[measurements_type(db)], and
+        measurements_type returns an unhashable UnknownEnumValue when the
+        attributes row is missing -- so that lookup raises a bare TypeError.
+        Analyze only builds summary tables and views, none of which the serving
+        layer reads, so skipping degrades nothing we serve; letting it raise would
+        turn an otherwise complete sync into a reported failure."""
+        log: list[str] = []
+        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.ingest"):
+            make_ingest(tmp_path, log=log).analyze()
+        assert log == []
+        assert "measurement_system" in caplog.text
 
 
 class TestConfigSafety:
@@ -297,7 +327,9 @@ class TestUncoveredBranches:
         and reading it must not abort the import that would create one."""
         log: list[str] = []
         ingest = make_ingest(tmp_path, log=log)
-        ingest._garmin_db = object()  # type: ignore[assignment]
+        # The handles are built lazily now, so planting them is what forces
+        # Attributes.measurements_type to fail.
+        ingest._handles = (object(), object())
         ingest.import_(Event())
         assert "rhr_data" in log
 
@@ -324,3 +356,111 @@ class StopAfterStep:
 
     def is_set(self) -> bool:
         return self._after in self._log
+
+
+class TestRebuild:
+    """The owner's way out of a schema mismatch, which is otherwise a dead end."""
+
+    @staticmethod
+    def _capturing_ingest(tmp_path: Path, log: list[str]) -> tuple[GarminDbIngest, list[bool]]:
+        latest_flags: list[bool] = []
+
+        def step(name: str):
+            def make(*args: object, **kwargs: object) -> FakeStep:
+                if len(args) >= 3 and isinstance(args[2], bool):
+                    latest_flags.append(args[2])
+                return FakeStep(name, log)
+
+            return make
+
+        settings = Settings(app_data_dir=tmp_path / "appdata")
+        ensure_config(settings, user="rider@example.com")
+        bindings = Bindings(
+            download=lambda gc_config: FakeDownload(log),
+            user_settings=step("user_settings"),
+            personal_information=step("personal_information"),
+            social_profile=step("social_profile"),
+            summary=step("summary_data"),
+            hydration=step("hydration_data"),
+            monitoring_fit=lambda *a, **k: FakeStep("monitoring_fit", log),
+            monitoring_processor=lambda *a, **k: "monitoring-processor",
+            sleep_json=step("sleep_json"),
+            sleep_fit=step("sleep_fit"),
+            sleep_processor=lambda *a, **k: "sleep-processor",
+            rhr=step("rhr_data"),
+            hrv=step("hrv_data"),
+            analyze=lambda gc_config, debug: FakeAnalyze(log),
+        )
+        return GarminDbIngest(settings, bindings=bindings), latest_flags
+
+    def test_it_reimports_everything_rather_than_the_last_24_hours(self, tmp_path: Path) -> None:
+        """Importers read `latest` as "files whose mtime is in the last 24h". A
+        rebuild has just deleted the databases, so the whole retained corpus has to
+        be reimported or the rows are simply gone."""
+        log: list[str] = []
+        ingest, latest_flags = self._capturing_ingest(tmp_path, log)
+        plant_measurement_system(ingest)
+        ingest.rebuild(Event())
+        assert latest_flags
+        assert not any(latest_flags)
+        # Deleted along with the database, then replanted so analyze can run --
+        # in production the profile importers are what put it back.
+        plant_measurement_system(ingest)
+        ingest.analyze()
+        assert "create_dynamic_views" in log
+
+    def test_a_normal_sync_still_imports_only_the_latest(self, tmp_path: Path) -> None:
+        log: list[str] = []
+        ingest, latest_flags = self._capturing_ingest(tmp_path, log)
+        ingest.import_(Event())
+        assert all(latest_flags)
+
+    def test_it_never_downloads(self, tmp_path: Path) -> None:
+        """Persisting the raw JSON/FIT corpus is exactly what makes a rebuild a
+        local reimport of minutes rather than hours of re-fetching."""
+        log: list[str] = []
+        ingest, _ = self._capturing_ingest(tmp_path, log)
+        ingest.rebuild(Event())
+        assert "login" not in log
+
+    def test_it_deletes_both_database_files_first(self, tmp_path: Path) -> None:
+        log: list[str] = []
+        ingest, _ = self._capturing_ingest(tmp_path, log)
+        ingest.table_stats()  # forces the handles, and creates the files
+        db_dir = Path(ingest._db_params.db_path)
+        assert (db_dir / "garmin.db").exists()
+
+        deleted: list[str] = []
+        original = (db_dir / "garmin.db").stat().st_ino
+        ingest.rebuild(Event())
+        # import_ recreates them through create_all, so the test is that the file
+        # is a NEW inode rather than that it is absent.
+        assert (db_dir / "garmin.db").stat().st_ino != original
+        assert deleted == []
+
+    def test_it_recovers_a_corpus_whose_schema_is_too_old_to_open(self, tmp_path: Path) -> None:
+        """The whole point. A stale schema makes constructing a DB raise, so the
+        files must be deleted before anything tries to open them."""
+        log: list[str] = []
+        ingest, _ = self._capturing_ingest(tmp_path, log)
+        ingest.table_stats()
+        db_file = Path(ingest._db_params.db_path) / "garmin.db"
+        with sqlite3.connect(db_file) as db:
+            db.execute("UPDATE _attributes SET value = '1' WHERE key = 'db.version'")
+
+        # A fresh adapter, exactly as the sync engine would build one: constructing
+        # it must not raise even though the schema on disk is unopenable.
+        broken, _ = self._capturing_ingest(tmp_path, log)
+        with pytest.raises(RuntimeError):
+            broken.table_stats()
+
+        broken.rebuild(Event())
+        assert broken.table_stats()["sleep"].rows == 0
+
+    def test_a_stop_request_skips_the_analyze_phase(self, tmp_path: Path) -> None:
+        log: list[str] = []
+        ingest, _ = self._capturing_ingest(tmp_path, log)
+        stop = Event()
+        stop.set()
+        ingest.rebuild(stop)
+        assert "create_dynamic_views" not in log

@@ -1,9 +1,18 @@
-"""Litestar application: the health probe, the owner setup surface, and the sync loop.
+"""Litestar application: the health probe, the owner surface, /v1/*, and the sync loop.
 
-The ``/v1/*`` spec surface is not implemented yet (it is the serving layer, and it
-needs the GarminDB mapping work). The manifest already advertises the service, which
-is safe: the spec's consumer client treats any non-200 from a provider as "this
-provider has nothing", so a consumer routed here simply sees no data.
+Three things are wired together here and nowhere else:
+
+- The **GarminConnection** is opened once in a lifespan hook rather than at import,
+  so nothing touches the data directory until the process is actually starting, and
+  a stale schema degrades ``/v1/*`` to 503 without taking ``/health`` or ``/setup``
+  with it.
+- The **sync engine** is given a callback that resets that connection. After a
+  rebuild, pooled handles point at the deleted inode and would go on serving stale
+  rows silently; and the account's timezone only arrives with the first profile
+  import, so the boot-time resolution legitimately has to be retried.
+- ``/health`` stays unconditional. An unlinked account, a stale corpus and an
+  unreachable Garmin are all normal states awaiting attention, and failing the
+  probe for any of them makes the router restart a container that is working.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ from garmin_health.auth import GarminAuthenticator
 from garmin_health.config import Settings
 from garmin_health.config import settings_from_env
 from garmin_health.routes.owner import owner_router
+from garmin_health.routes.service import v1_router
 from garmin_health.sync import Ingest
 from garmin_health.sync import SyncEngine
 
@@ -49,9 +59,8 @@ def health() -> dict[str, str]:
 
 def _default_ingest_factory(settings: Settings) -> Callable[[], Ingest]:
     def build() -> Ingest:
-        # Imported lazily so a container that has never linked an account does not
-        # pay GarminDB's import cost, and so nothing touches the config directory
-        # until there is actually a sync to run.
+        # Imported lazily so nothing touches the config directory until there is
+        # actually a sync to run.
         from garmin_health.garmin.ingest import GarminDbIngest  # noqa: PLC0415
 
         return GarminDbIngest(settings)
@@ -67,11 +76,46 @@ def create_app(
 ) -> Litestar:
     settings = settings if settings is not None else settings_from_env()
     authenticator = authenticator if authenticator is not None else GarminAuthenticator(settings)
+    state = State({"settings": settings, "authenticator": authenticator})
+
+    def on_corpus_changed() -> None:
+        """Called after every sync, on the sync's own worker thread.
+
+        Cheap (two ``engine.dispose()`` calls and two DB constructions) and the
+        only thing that makes a rebuilt corpus, or a timezone that arrived with the
+        first profile import, visible to the serving layer.
+        """
+        service = state.get("health_service")
+        if service is None:
+            return
+        service.connection.reset()
+        service.invalidate()
+
     engine = SyncEngine(
         settings=settings,
         authenticator=authenticator,
         ingest_factory=ingest_factory or _default_ingest_factory(settings),
+        on_corpus_changed=on_corpus_changed,
     )
+    state["sync_engine"] = engine
+
+    @asynccontextmanager
+    async def serving_layer(_: Litestar) -> AsyncGenerator[None, None]:
+        # Imported here rather than at module scope so the GarminDB import cost is
+        # paid at startup rather than at import, which keeps `create_app` cheap for
+        # anything that only wants to inspect the routes.
+        from garmin_health.garmin.connection import GarminConnection  # noqa: PLC0415
+        from garmin_health.service import HealthDataService  # noqa: PLC0415
+
+        connection = GarminConnection(settings)
+        state["health_service"] = HealthDataService(connection)
+        if connection.fault is not None:
+            logger.error("Serving layer degraded: %s", connection.fault)
+        try:
+            yield
+        finally:
+            state.pop("health_service", None)
+            connection.close()
 
     @asynccontextmanager
     async def sync_loop(_: Litestar) -> AsyncGenerator[None, None]:
@@ -85,9 +129,9 @@ def create_app(
                 await asyncio.wait_for(task, timeout=SHUTDOWN_GRACE_SECONDS)
 
     return Litestar(
-        route_handlers=[health, owner_router],
-        state=State({"settings": settings, "authenticator": authenticator, "sync_engine": engine}),
-        lifespan=[sync_loop],
+        route_handlers=[health, owner_router, v1_router],
+        state=state,
+        lifespan=[serving_layer, sync_loop],
     )
 
 

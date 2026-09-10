@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import threading
 from threading import Event
 
 import pytest
@@ -63,6 +64,13 @@ class TestIncrementalRange:
         assert days == 0
 
 
+def linked_authenticator(settings: Settings) -> GarminAuthenticator:
+    """An authenticator that reports LINKED, by planting the token GarminDB reads."""
+    settings.config_dir.mkdir(parents=True, exist_ok=True)
+    settings.token_file.write_text('{"di_refresh_token": "r"}')
+    return GarminAuthenticator(settings, garmin_factory=RecordingFactory(needs_mfa=False))
+
+
 def make_engine(
     settings: Settings,
     *,
@@ -71,11 +79,11 @@ def make_engine(
     interval: int = 3600,
 ) -> tuple[SyncEngine, FakeIngest, GarminAuthenticator]:
     ingest = ingest or FakeIngest()
-    auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory(needs_mfa=False))
-    if linked:
-        settings.config_dir.mkdir(parents=True, exist_ok=True)
-        settings.token_file.write_text('{"di_refresh_token": "r"}')
-        auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory(needs_mfa=False))
+    auth = (
+        linked_authenticator(settings)
+        if linked
+        else GarminAuthenticator(settings, garmin_factory=RecordingFactory(needs_mfa=False))
+    )
     engine = SyncEngine(
         settings=Settings(app_data_dir=settings.app_data_dir, sync_interval_seconds=interval),
         authenticator=auth,
@@ -332,3 +340,118 @@ class TestResilience:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert calls["n"] >= 2
+
+
+class TestCorpusChangedCallback:
+    """The serving layer holds pooled handles that a rebuild invalidates."""
+
+    async def test_it_fires_after_a_successful_sync(self, settings: Settings) -> None:
+        fired: list[int] = []
+        engine = SyncEngine(
+            settings=settings,
+            authenticator=linked_authenticator(settings),
+            ingest_factory=lambda: FakeIngest(),
+            on_corpus_changed=lambda: fired.append(1),
+        )
+        await engine.run_once()
+        assert fired == [1]
+
+    async def test_it_fires_after_a_failed_sync_too(self, settings: Settings) -> None:
+        """A sync that died mid-import still changed the corpus, and the failure
+        may itself be what a reset would clear."""
+        fired: list[int] = []
+        engine = SyncEngine(
+            settings=settings,
+            authenticator=linked_authenticator(settings),
+            ingest_factory=lambda: FakeIngest(fail_on="import"),
+            on_corpus_changed=lambda: fired.append(1),
+        )
+        await engine.run_once()
+        assert fired == [1]
+
+    async def test_a_failing_callback_does_not_fail_the_sync(self, settings: Settings) -> None:
+        def explode() -> None:
+            raise RuntimeError("the serving layer is unhappy")
+
+        engine = SyncEngine(
+            settings=settings,
+            authenticator=linked_authenticator(settings),
+            ingest_factory=lambda: FakeIngest(),
+            on_corpus_changed=explode,
+        )
+        report = await engine.run_once()
+        assert report is not None
+        assert report.error is None
+
+    async def test_it_does_not_fire_when_no_sync_ran(self, settings: Settings) -> None:
+        fired: list[int] = []
+        engine = SyncEngine(
+            settings=settings,
+            authenticator=GarminAuthenticator(settings, garmin_factory=RecordingFactory()),
+            ingest_factory=lambda: FakeIngest(),
+            on_corpus_changed=lambda: fired.append(1),
+        )
+        assert await engine.run_once() is None
+        assert fired == []
+
+
+class TestRebuild:
+    async def test_it_runs_the_rebuild_and_nothing_else(self, settings: Settings) -> None:
+        """No download: the whole point is that the retained JSON/FIT corpus makes
+        a schema rebuild a local reimport rather than hours of re-downloading."""
+        ingest = FakeIngest()
+        engine = SyncEngine(
+            settings=settings,
+            authenticator=linked_authenticator(settings),
+            ingest_factory=lambda: ingest,
+        )
+        report = await engine.rebuild_once()
+        assert report is not None
+        assert report.error is None
+        assert "rebuild" in ingest.calls
+        assert "download" not in ingest.calls
+
+    async def test_it_reports_a_failure_rather_than_raising(self, settings: Settings) -> None:
+        engine = SyncEngine(
+            settings=settings,
+            authenticator=linked_authenticator(settings),
+            ingest_factory=lambda: FakeIngest(fail_on="rebuild"),
+        )
+        report = await engine.rebuild_once()
+        assert report is not None
+        assert report.error is not None
+        assert report.phase is SyncPhase.REBUILD
+
+    async def test_it_resets_the_serving_layer_afterwards(self, settings: Settings) -> None:
+        """Without this the pooled handles still point at the deleted inode."""
+        fired: list[int] = []
+        engine = SyncEngine(
+            settings=settings,
+            authenticator=linked_authenticator(settings),
+            ingest_factory=lambda: FakeIngest(),
+            on_corpus_changed=lambda: fired.append(1),
+        )
+        await engine.rebuild_once()
+        assert fired == [1]
+
+    async def test_it_needs_no_linked_account(self, settings: Settings) -> None:
+        """A rebuild is purely local. Refusing it while unlinked would strand a
+        container whose corpus is broken and whose token has expired."""
+        engine = SyncEngine(
+            settings=settings,
+            authenticator=GarminAuthenticator(settings, garmin_factory=RecordingFactory()),
+            ingest_factory=lambda: FakeIngest(),
+        )
+        report = await engine.rebuild_once()
+        assert report is not None
+        assert report.error is None
+
+    async def test_it_refuses_to_start_while_a_sync_is_in_flight(self, settings: Settings) -> None:
+        engine = SyncEngine(
+            settings=settings,
+            authenticator=linked_authenticator(settings),
+            ingest_factory=lambda: FakeIngest(block_on=threading.Event()),
+        )
+        assert await engine.trigger() is True
+        assert await engine.trigger_rebuild() is False
+        engine.request_stop()
