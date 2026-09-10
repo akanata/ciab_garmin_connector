@@ -1,5 +1,5 @@
 [app]
-name = "garmin-health"
+name = "garmin-connector"
 version = "0.1.0"
 description = "Serves Garmin Connect health data over the Cloud in a Bottle health-data service"
 
