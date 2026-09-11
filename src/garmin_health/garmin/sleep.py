@@ -480,8 +480,7 @@ def _build_one(
         # Lights-out to onset, which GarminDB simply does not have: sleep.start is
         # the detected onset and the first event is already a sleep stage, so every
         # derivation is structurally zero or noise. Garmin Connect exposes
-        # sleepLatencySeconds, but GarminDB 3.9.0 reads ten keys from
-        # dailySleepDTO and that is not one of them.
+        # sleepLatencySeconds, but GarminDB cannot see this value (as of v3.9.0).
         latency=None,
         average_heart_rate=(
             HeartRateAvg(value=average_hr, source=SOURCE) if average_hr is not None else None
