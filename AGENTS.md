@@ -312,6 +312,29 @@ imported only by `garmin/*`.
 
 **Auth.**
 
+- **Garmin's sign-in portal sits behind a Cloudflare bot challenge**, and a
+  container on a datacenter IP frequently cannot pass it. garminconnect 0.3.11
+  already exhausts the impersonation lane (curl_cffi TLS rotation, `ua_generator`,
+  anti-WAF delays, a 5-strategy chain), so "impersonate harder" is not the fix.
+- That challenge guards **only** the interactive credential exchange on
+  `sso.garmin.com`. Refresh runs against `diauth.garmin.com` and data against
+  `connectapi.garmin.com`; garminconnect refreshes proactively *precisely* to
+  avoid the blocked endpoint (`__init__.py:703`), and GarminDB's own adapter tries
+  the token store before credentials. **So a token minted once anywhere links the
+  app for the life of its refresh token.** That is what `POST /setup/token` and
+  `GarminAuthenticator.link_with_token` are for.
+- `Garmin.login(tokenstore)` accepts **inline JSON** as well as a path, detected
+  structurally by a leading brace (`__init__.py:182`). The import path uses that
+  to verify a pasted token *before* persisting it -- a dead token written to disk
+  is the exact "looks linked, every sync fails" trap.
+- Do not "fix" the mint snippet on `/setup` to `g.garth.dump(...)`. That is the
+  older library's spelling; 0.3.11 is `g.client.dump(...)`, and
+  `test_the_mint_snippet_matches_the_installed_library` pins it.
+- Two approaches that look promising and are **dead ends**: reverse-proxying the
+  challenge through this app's domain (`cf_clearance` is scoped to `.garmin.com`
+  and the challenge platform validates the host), and having the owner's browser
+  drive the SSO with `fetch` (no CORS grant from `sso.garmin.com`).
+
 - There is no OAuth consent flow for this API — `garminconnect` replays the
   owner's **real Garmin password** against `sso.garmin.com`. We log in ourselves
   and hand GarminDB the resulting token, so the password is never written to

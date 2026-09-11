@@ -1,9 +1,12 @@
 import datetime as dt
+import inspect
+import json
 import threading
 import time
 from collections.abc import Iterator
 
 import pytest
+from garminconnect import Garmin
 from garminconnect import GarminConnectAuthenticationError
 from litestar.testing import TestClient
 
@@ -16,6 +19,7 @@ from garmin_health.preferences import STAT_LABELS
 from garmin_health.preferences import ImportPreferences
 from garmin_health.preferences import load_preferences
 from garmin_health.preferences import save_preferences
+from garmin_health.routes.owner import MINT_SNIPPET
 from garmin_health.routes.owner import _join_names
 from garmin_health.sync import TableStat
 from tests.fakes import FakeIngest
@@ -654,3 +658,100 @@ class TestCoverageWording:
     )
     def test_names_are_joined_as_prose(self, names: list[str], expected: str) -> None:
         assert _join_names(names) == expected
+
+
+TOKEN_JSON = json.dumps(
+    {"di_token": "access", "di_refresh_token": "refresh", "di_client_id": "client"}
+)
+
+
+class TestTokenImportPage:
+    """The way past a Cloudflare bot challenge on Garmin's sign-in portal."""
+
+    def test_the_unlinked_page_offers_it(self, client: TestClient) -> None:
+        page = client.get("/setup", headers=OWNER).text
+        assert "action='/setup/token'" in page
+        assert "bot challenge" in page.lower()
+
+    def test_it_explains_how_to_mint_one(self, client: TestClient) -> None:
+        """Nobody has garmin_tokens.json lying around; the page has to say how to
+        produce it on a machine that can sign in."""
+        page = client.get("/setup", headers=OWNER).text
+        assert "garmin_tokens.json" in page
+        assert "garminconnect" in page
+
+    def test_a_linked_account_is_not_offered_it(self, settings: Settings) -> None:
+        """A destructive-looking alternative should not sit on a working page."""
+        linked, _ = linked_client(settings)
+        with linked:
+            assert "action='/setup/token'" not in linked.get("/setup", headers=OWNER).text
+
+    def test_importing_a_token_links_the_account(self, client: TestClient) -> None:
+        response = client.post(
+            "/setup/token",
+            data={"token": TOKEN_JSON, "email": "rider@example.com"},
+            headers=OWNER,
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert client.get("/setup/status", headers=OWNER).json()["state"] == "linked"
+
+    def test_the_imported_token_is_what_syncs_will_read(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        client.post("/setup/token", data={"token": TOKEN_JSON}, headers=OWNER)
+        manager_path = settings.token_file
+        assert json.loads(manager_path.read_text())["di_refresh_token"] == "refresh"
+
+    def test_a_bad_token_is_explained_on_the_page(self, client: TestClient) -> None:
+        response = client.post(
+            "/setup/token", data={"token": "{oops"}, headers=OWNER, follow_redirects=True
+        )
+        assert "valid JSON" in response.text
+        assert client.get("/setup/status", headers=OWNER).json()["state"] == "not_linked"
+
+    def test_a_truncated_token_names_the_missing_fields(self, client: TestClient) -> None:
+        response = client.post(
+            "/setup/token",
+            data={"token": json.dumps({"di_token": "t"})},
+            headers=OWNER,
+            follow_redirects=True,
+        )
+        assert "di_refresh_token" in response.text
+
+    def test_the_error_does_not_persist_across_refreshes(self, client: TestClient) -> None:
+        """One mistyped paste must not accuse the owner for ever."""
+        client.post("/setup/token", data={"token": "{oops"}, headers=OWNER)
+        assert "valid JSON" not in client.get("/setup", headers=OWNER).text
+
+    def test_the_token_is_never_echoed_back_into_the_page(self, client: TestClient) -> None:
+        """It is a bearer credential; it must not end up in browser history, a
+        screenshot, or a re-rendered form field."""
+        response = client.post(
+            "/setup/token",
+            data={"token": TOKEN_JSON.replace("refresh", "SECRETVALUE")},
+            headers=OWNER,
+            follow_redirects=True,
+        )
+        assert "SECRETVALUE" not in response.text
+
+    def test_it_is_owner_gated(self, client: TestClient) -> None:
+        assert client.post("/setup/token", data={"token": TOKEN_JSON}).status_code == 401
+
+
+def test_the_mint_snippet_matches_the_installed_library() -> None:
+    """The page tells the owner to run this on another machine, so a library
+    rename must break the build rather than ship instructions that fail.
+
+    ``g.garth.dump`` is the *older* library's spelling and does not exist on
+    garminconnect 0.3.11 -- this pins the one that does.
+    """
+    client = Garmin()
+    assert "g.client.dump(" in MINT_SNIPPET
+    assert "g.garth" not in MINT_SNIPPET
+    assert hasattr(client, "client")
+    assert callable(client.client.dump)
+    # The constructor call in the snippet is positional (email, password).
+    assert 'Garmin("you@example.com", "your-password")' in MINT_SNIPPET
+    parameters = list(inspect.signature(Garmin.__init__).parameters)
+    assert parameters[1:3] == ["email", "password"]

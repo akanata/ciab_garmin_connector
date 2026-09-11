@@ -26,6 +26,7 @@ The login attempt does not survive a process restart; the token does.
 
 from __future__ import annotations
 
+import json
 import logging
 from enum import StrEnum
 from threading import Lock
@@ -43,6 +44,11 @@ from garmin_health.garmin_config import ensure_config
 logger = logging.getLogger(__name__)
 
 NEEDS_MFA = "needs_mfa"
+
+# What garminconnect's own dump() writes, and what GarminDB later reads. Only the
+# refresh token is load-bearing -- it is what mints new access tokens -- but a
+# paste missing any of them is a truncated copy rather than a usable token.
+TOKEN_FIELDS = ("di_token", "di_refresh_token", "di_client_id")
 
 
 class AuthError(Exception):
@@ -138,6 +144,23 @@ class GarminAuthenticator:
     async def complete_mfa(self, code: str) -> AuthStatus:
         return await anyio.to_thread.run_sync(self._complete_mfa_sync, code)
 
+    async def link_with_token(self, raw: str, *, email: str = "") -> AuthStatus:
+        """Link using a token minted elsewhere, bypassing the sign-in portal.
+
+        Garmin's SSO portal sits behind a Cloudflare bot challenge that a
+        container on a datacenter IP frequently cannot pass. That challenge guards
+        only the interactive credential exchange: refresh runs against
+        ``diauth.garmin.com`` and data against ``connectapi.garmin.com``, and
+        garminconnect refreshes proactively *precisely* to avoid the blocked
+        endpoint (``__init__.py:703``). GarminDB's own adapter tries the token
+        store before credentials too.
+
+        So a token minted once on any machine that can sign in -- a laptop on a
+        residential connection -- links this app for the life of the refresh token,
+        and nothing here ever has to pass a challenge.
+        """
+        return await anyio.to_thread.run_sync(self._link_with_token_sync, raw, email)
+
     async def unlink(self) -> AuthStatus:
         return await anyio.to_thread.run_sync(self._unlink_sync)
 
@@ -220,6 +243,69 @@ class GarminAuthenticator:
             self._email = pending.email
             self._was_linked = True
             self._error = None
+            return self.status()
+
+    @staticmethod
+    def _validated_token(raw: str) -> str:
+        """Check the paste is a whole token document before going near the network.
+
+        Shape first, so a paste that lost a brace says so plainly instead of
+        coming back as an opaque authentication failure the owner cannot act on.
+        """
+        text = (raw or "").strip()
+        if not text:
+            raise AuthError("Paste the contents of garmin_tokens.json.")
+        try:
+            document = json.loads(text)
+        except ValueError as exc:
+            raise AuthError(f"That is not valid JSON: {exc}.") from exc
+        if not isinstance(document, dict):
+            raise AuthError(
+                f"Expected a JSON object with the token fields, got {type(document).__name__}."
+            )
+        missing = [field for field in TOKEN_FIELDS if not document.get(field)]
+        if missing:
+            raise AuthError(
+                f"The token is missing {', '.join(missing)}. Copy the whole "
+                "garmin_tokens.json file, including the outer braces."
+            )
+        return text
+
+    def _link_with_token_sync(self, raw: str, email: str) -> AuthStatus:
+        email = (email or "").strip()
+        try:
+            token = self._validated_token(raw)
+        except AuthError as exc:
+            raise self._fail(str(exc)) from exc
+
+        with self._lock:
+            # Importing a token is a complete alternative to the credential flow,
+            # so any challenge left over from a failed sign-in must not outlive it.
+            self._pending = None
+            self._error = None
+            if email:
+                ensure_config(self._settings, user=email)
+
+            client = self._factory(is_cn=self._settings.is_cn)
+            try:
+                # An inline JSON token store is detected structurally, by a leading
+                # brace (__init__.py:182), and takes the load-and-refresh path
+                # rather than the portal. Verified before persisting: a token the
+                # API rejects, written to disk anyway, is the exact "looks linked
+                # but every sync fails" trap this codebase exists to avoid.
+                client.login(token)
+            except Exception as exc:
+                logger.warning("Imported Garmin token was rejected: %s", exc)
+                raise self._fail(
+                    f"Garmin rejected that token ({exc}). Mint a fresh one and try again."
+                ) from exc
+
+            self._persist_tokens(client)
+            if email:
+                self._email = email
+            self._was_linked = True
+            self._error = None
+            logger.info("Garmin account linked from an imported token.")
             return self.status()
 
     def _unlink_sync(self) -> AuthStatus:

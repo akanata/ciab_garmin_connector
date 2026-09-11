@@ -31,12 +31,23 @@ class FakeInnerClient:
     def __init__(self) -> None:
         self.dumped_to: list[str] = []
         self._tokenstore_path: str | None = None
+        self.loaded: dict[str, Any] | None = None
 
     def dump(self, path: str) -> None:
         self.dumped_to.append(path)
         p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"di_token": "t", "di_refresh_token": "r", "di_client_id": "c"}))
+        # The real dump() writes 0600 inside a 0700 directory rather than letting
+        # the process umask decide (GHSA-wjhr-76vg-2hvc). The token file is a
+        # bearer credential, so the fake has to model that or nothing tests it.
+        p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # The real dump() writes what the client currently holds, which for a
+        # token login is the loaded (and possibly refreshed) token, not the bytes
+        # that were handed in.
+        payload = json.dumps(
+            self.loaded or {"di_token": "t", "di_refresh_token": "r", "di_client_id": "c"}
+        )
+        p.write_text(payload)
+        p.chmod(0o600)
 
 
 class FakeGarmin:
@@ -52,8 +63,11 @@ class FakeGarmin:
         needs_mfa: bool = False,
         mfa_code: str = "123456",
         login_error: Exception | None = None,
+        token_rejected: bool = False,
         **_: Any,
     ) -> None:
+        self._token_rejected = token_rejected
+        self.token_logins: list[str] = []
         self.username = email
         self.password = password
         self.is_cn = is_cn
@@ -70,6 +84,15 @@ class FakeGarmin:
 
     def login(self, tokenstore: str | None = None) -> tuple[str | None, str | None]:
         self.login_calls.append(tokenstore)
+        # garminconnect detects an inline token store structurally, by a leading
+        # "{" or "[", and never touches the SSO portal for it (__init__.py:182).
+        if tokenstore and tokenstore.strip().startswith(("{", "[")):
+            self.token_logins.append(tokenstore)
+            if self._token_rejected:
+                raise GarminConnectAuthenticationError("token rejected by the API")
+            payload = json.loads(tokenstore)
+            self.client.loaded = payload
+            return None, None
         if tokenstore and Path(tokenstore).is_file():
             return None, None  # cached-token path
         if self._login_error is not None:

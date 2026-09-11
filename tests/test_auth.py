@@ -1,4 +1,5 @@
 import json
+import stat
 
 import pytest
 from garminconnect import GarminConnectAuthenticationError
@@ -204,3 +205,111 @@ async def test_awaiting_mfa_detail_survives_being_read_twice(settings: Settings)
     await auth.login("rider@example.com", "hunter2")
     assert auth.status().detail == auth.status().detail
     assert auth.status().detail is not None
+
+
+VALID_TOKEN = json.dumps(
+    {"di_token": "access", "di_refresh_token": "refresh", "di_client_id": "client"}
+)
+
+
+class TestTokenImport:
+    """The escape hatch for a Cloudflare bot challenge on the sign-in portal.
+
+    The challenge guards only the interactive credential exchange on
+    sso.garmin.com. Refresh (diauth.garmin.com) and data (connectapi.garmin.com)
+    are off that path -- garminconnect refreshes proactively precisely to avoid
+    the blocked endpoint -- so a token minted anywhere links the app for good.
+    """
+
+    async def test_a_valid_token_links_the_account(self, settings: Settings) -> None:
+        factory = RecordingFactory()
+        auth = GarminAuthenticator(settings, garmin_factory=factory)
+        result = await auth.link_with_token(VALID_TOKEN, email="rider@example.com")
+        assert result.state is LinkState.LINKED
+        assert settings.token_file.is_file()
+
+    async def test_it_never_touches_the_sign_in_portal(self, settings: Settings) -> None:
+        """The whole point: no credentials, no SSO round trip, no challenge."""
+        factory = RecordingFactory()
+        auth = GarminAuthenticator(settings, garmin_factory=factory)
+        await auth.link_with_token(VALID_TOKEN, email="")
+
+        client = factory.clients[0]
+        assert client.token_logins == [VALID_TOKEN]
+        assert client.password is None
+        assert factory.calls[0].get("password") is None
+
+    async def test_the_persisted_file_is_what_the_client_holds(self, settings: Settings) -> None:
+        """Written through the client's own dump(), not by copying the pasted
+        bytes: dump() normalises and picks up a proactive refresh."""
+        auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory())
+        await auth.link_with_token(VALID_TOKEN, email="")
+        assert json.loads(settings.token_file.read_text())["di_refresh_token"] == "refresh"
+
+    async def test_the_token_file_is_owner_only(self, settings: Settings) -> None:
+        """It is a bearer credential granting persistent account access."""
+        auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory())
+        await auth.link_with_token(VALID_TOKEN, email="")
+        assert stat.S_IMODE(settings.token_file.stat().st_mode) == 0o600
+
+    async def test_the_email_is_recorded_for_the_config(self, settings: Settings) -> None:
+        auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory())
+        await auth.link_with_token(VALID_TOKEN, email="rider@example.com")
+        assert auth.status().email == "rider@example.com"
+        assert config_user(settings) == "rider@example.com"
+
+    async def test_the_email_is_optional(self, settings: Settings) -> None:
+        """A token carries no email, and the account links perfectly well without
+        one -- it only labels the page and GarminDB's unusable credential fallback."""
+        auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory())
+        assert (await auth.link_with_token(VALID_TOKEN, email="")).state is LinkState.LINKED
+
+    @pytest.mark.parametrize(
+        "raw", ["", "   ", "not json", "[]", '"a string"', "{}", '{"di_token": "t"}']
+    )
+    async def test_a_malformed_token_is_refused_before_any_network_call(
+        self, settings: Settings, raw: str
+    ) -> None:
+        """Shape-checked first: a paste that lost a brace should say so, not come
+        back as an opaque authentication failure."""
+        factory = RecordingFactory()
+        auth = GarminAuthenticator(settings, garmin_factory=factory)
+        with pytest.raises(AuthError):
+            await auth.link_with_token(raw, email="")
+        assert factory.clients == []
+        assert not settings.token_file.exists()
+
+    async def test_a_token_the_api_rejects_leaves_nothing_behind(self, settings: Settings) -> None:
+        """A persisted-but-dead token is the exact "looks linked, every sync
+        fails" trap this codebase exists to avoid."""
+        auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory(token_rejected=True))
+        with pytest.raises(AuthError):
+            await auth.link_with_token(VALID_TOKEN, email="")
+        assert not settings.token_file.exists()
+        assert auth.status().state is LinkState.NOT_LINKED
+
+    async def test_a_rejection_is_reported_as_a_one_shot_flash(self, settings: Settings) -> None:
+        auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory(token_rejected=True))
+        with pytest.raises(AuthError):
+            await auth.link_with_token(VALID_TOKEN, email="")
+        assert auth.take_error() is not None
+        assert auth.take_error() is None
+
+    async def test_it_relinks_an_account_that_needs_reauth(self, settings: Settings) -> None:
+        auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory())
+        await auth.link_with_token(VALID_TOKEN, email="")
+        settings.token_file.unlink()
+        assert auth.status().state is LinkState.NEEDS_REAUTH
+
+        await auth.link_with_token(VALID_TOKEN, email="")
+        assert auth.status().state is LinkState.LINKED
+
+    async def test_it_clears_a_half_finished_mfa_attempt(self, settings: Settings) -> None:
+        """Importing a token is a complete alternative to the credential flow, so
+        a challenge left over from a failed sign-in must not outlive it."""
+        auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory(needs_mfa=True))
+        await auth.login("rider@example.com", "hunter2")
+        assert auth.status().state is LinkState.AWAITING_MFA
+
+        await auth.link_with_token(VALID_TOKEN, email="")
+        assert auth.status().state is LinkState.LINKED

@@ -173,6 +173,10 @@ STYLE = (
     "body{font:16px/1.5 system-ui,sans-serif;margin:0 auto;padding:2rem;max-width:34rem}"
     "label{display:block;margin:.75rem 0}input{display:block;width:100%;padding:.5rem;margin-top:.25rem}"
     "button{padding:.5rem 1rem;margin-top:.5rem}"
+    "textarea{display:block;width:100%;padding:.5rem;margin-top:.25rem;font-family:ui-monospace,"
+    "monospace;font-size:.8rem}"
+    "pre{background:#f1f5f9;padding:.75rem;overflow-x:auto;font-size:.8rem;border-radius:3px}"
+    "code{background:#f1f5f9;padding:.1em .3em;border-radius:3px;font-size:.9em}"
     "[hidden]{display:none!important}"
     ".error{padding:.75rem;background:#fdecea;border-left:3px solid #d32f2f}"
     ".detail{padding:.75rem;background:#fff4e5;border-left:3px solid #d97706}"
@@ -242,6 +246,42 @@ def _import_scope_form(view: PageView) -> str:
         + _button("Save import scope")
         + "</form>"
         + warning
+    )
+
+
+MINT_SNIPPET = """from garminconnect import Garmin
+g = Garmin("you@example.com", "your-password")
+g.login()                              # answer the MFA prompt if you have one
+g.client.dump("./garmin_tokens.json")"""
+
+
+def _token_import_form() -> str:
+    """The way past a Cloudflare bot challenge on Garmin's sign-in portal.
+
+    The challenge guards only the interactive credential exchange. Refresh and
+    data use different hosts, so a token minted anywhere links this app for the
+    life of its refresh token.
+    """
+    return (
+        "<h2>Sign-in blocked by a bot challenge?</h2>"
+        "<p class='note'>Garmin's sign-in page sits behind a Cloudflare bot check that a server "
+        "often cannot pass, even though your account and password are fine. You can sign in once "
+        "on a computer that <em>can</em> reach it and bring the resulting token here &mdash; this "
+        "app only ever needs the token, and refreshing it later does not go through the blocked "
+        "page.</p>"
+        "<p class='note'>On that computer, with <code>pip install garminconnect</code>:</p>"
+        f"<pre>{escape(MINT_SNIPPET)}</pre>"
+        "<p class='note'>Then paste the contents of the <code>garmin_tokens.json</code> it "
+        "writes:</p>"
+        "<form method='post' action='/setup/token' data-busy='Checking the token with Garmin...'>"
+        "<label>Garmin Connect email <span class='note'>optional, only labels this page</span>"
+        "<input name='email' type='email' autocomplete='off'></label>"
+        "<label>garmin_tokens.json"
+        "<textarea name='token' rows='4' required autocomplete='off' spellcheck='false'"
+        ' placeholder=\'{"di_token": ..., "di_refresh_token": ..., "di_client_id": ...}\'>'
+        "</textarea></label>" + _button("Link with this token") + "</form>"
+        "<p class='warning'>That file grants ongoing access to your Garmin account, exactly as a "
+        "password would. It is stored owner-only and never shown again.</p>"
     )
 
 
@@ -381,7 +421,7 @@ def _render(view: PageView) -> str:
             "<label>Password<input name='password' type='password' autocomplete='current-password'"
             " required></label>" + _button("Link Garmin account") + "</form>"
             "<p class='note'>Signing in to Garmin takes a few seconds, and longer if your account "
-            "uses MFA. Leave this page open while it works.</p>"
+            "uses MFA. Leave this page open while it works.</p>" + _token_import_form()
         )
 
     # aria-live so a screen reader announces the in-flight message when it appears.
@@ -496,6 +536,26 @@ async def submit_mfa(
     return Redirect("/setup", status_code=HTTP_303_SEE_OTHER)
 
 
+@post("/setup/token", status_code=HTTP_303_SEE_OTHER)
+async def submit_token(
+    state: State,
+    data: Annotated[dict[str, str], Body(media_type=RequestEncodingType.URL_ENCODED)],
+) -> Redirect:
+    """Link from a token minted elsewhere, for accounts the bot check blocks.
+
+    Redirects either way, exactly like the credential form: the failure is held as
+    a one-shot flash and rendered once. That also keeps the pasted token out of a
+    re-rendered form field, and so out of browser history and screenshots.
+    """
+    try:
+        await _authenticator(state).link_with_token(
+            data.get("token", ""), email=data.get("email", "")
+        )
+    except AuthError:
+        pass
+    return Redirect("/setup", status_code=HTTP_303_SEE_OTHER)
+
+
 @post("/setup/unlink", status_code=HTTP_303_SEE_OTHER)
 async def unlink(state: State) -> Redirect:
     await _authenticator(state).unlink()
@@ -576,6 +636,7 @@ owner_router = Router(
         setup_status,
         submit_credentials,
         submit_mfa,
+        submit_token,
         unlink,
         submit_import_scope,
         trigger_sync,
