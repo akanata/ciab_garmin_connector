@@ -424,7 +424,7 @@ async def _page_view(
     )
 
 
-@get("/setup", media_type=MediaType.HTML)
+@get(["/", "/setup"], media_type=MediaType.HTML)
 async def setup_page(state: State) -> str:
     return _render(await _page_view(state))
 
