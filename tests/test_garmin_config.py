@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import stat
 from pathlib import Path
@@ -10,8 +11,12 @@ from garmin_health.garmin_config import InvalidGarminConfig
 from garmin_health.garmin_config import config_user
 from garmin_health.garmin_config import ensure_config
 from garmin_health.garmin_config import load_manager
+from garmin_health.garmin_config import read_config
 from garmin_health.garmin_config import render_config
 from garmin_health.garmin_config import validate_config
+from garmin_health.preferences import DOWNLOADABLE_STATS
+from garmin_health.preferences import ImportPreferences
+from garmin_health.preferences import save_preferences
 
 
 def test_rendered_config_passes_its_own_validator(settings: Settings) -> None:
@@ -129,3 +134,89 @@ def test_load_manager_raises_instead_of_exiting_on_a_bad_config(settings: Settin
     settings.garmin_config_file.write_text("{ not json")
     with pytest.raises(InvalidGarminConfig):
         load_manager(settings, repair=False)
+
+
+class TestImportScope:
+    """The owner's saved scope is what reaches GarminConnectConfig.json."""
+
+    def test_the_saved_start_date_is_written_to_every_stat(self, settings: Settings) -> None:
+        prefs = ImportPreferences(
+            start_date=dt.date(2024, 3, 1), enabled_stats=frozenset(DOWNLOADABLE_STATS)
+        )
+        document = render_config(settings, preferences=prefs)
+        dates = {k: v for k, v in document["data"].items() if k.endswith("_start_date")}
+        assert set(dates.values()) == {"2024-03-01"}
+
+    def test_disabled_metrics_are_switched_off_in_the_config(self, settings: Settings) -> None:
+        prefs = ImportPreferences(
+            start_date=dt.date(2024, 3, 1), enabled_stats=frozenset({"sleep", "hrv"})
+        )
+        stats = render_config(settings, preferences=prefs)["enabled_stats"]
+        assert stats["sleep"] is True
+        assert stats["hrv"] is True
+        assert stats["monitoring"] is False
+        assert stats["rhr"] is False
+
+    def test_the_stats_we_never_support_stay_off_whatever_is_saved(
+        self, settings: Settings
+    ) -> None:
+        """activities is by far the slowest download and has no download branch."""
+        prefs = ImportPreferences(
+            start_date=dt.date(2024, 3, 1), enabled_stats=frozenset(DOWNLOADABLE_STATS)
+        )
+        stats = render_config(settings, preferences=prefs)["enabled_stats"]
+        assert stats["activities"] is False
+        assert stats["weight"] is False
+
+    def test_every_key_garmindb_knows_is_still_present(self, settings: Settings) -> None:
+        """Statistics.from_string runs over whatever keys are here, and an absent
+        enabled_stats block makes GarminDB default every statistic to True."""
+        prefs = ImportPreferences(start_date=dt.date(2024, 3, 1), enabled_stats=frozenset())
+        stats = render_config(settings, preferences=prefs)["enabled_stats"]
+        assert set(stats) == {
+            "monitoring",
+            "steps",
+            "itime",
+            "sleep",
+            "rhr",
+            "weight",
+            "activities",
+            "hrv",
+        }
+        assert not any(stats.values())
+
+    def test_an_empty_selection_is_a_valid_config(self, settings: Settings) -> None:
+        prefs = ImportPreferences(start_date=dt.date(2024, 3, 1), enabled_stats=frozenset())
+        validate_config(render_config(settings, preferences=prefs))
+
+    def test_the_manager_reports_exactly_what_was_enabled(self, settings: Settings) -> None:
+        """End to end through GarminDB's own reader, which is what ingest calls."""
+        save_preferences(
+            settings,
+            ImportPreferences(
+                start_date=dt.date(2024, 3, 1), enabled_stats=frozenset({"sleep", "rhr"})
+            ),
+        )
+        manager = load_manager(settings)
+        assert {s.name for s in manager.enabled_stats()} == {"sleep", "rhr"}
+        assert manager.stat_start_date("sleep")[0] == dt.date(2024, 3, 1)
+
+    def test_ensure_config_reads_the_saved_scope_by_default(self, settings: Settings) -> None:
+        save_preferences(
+            settings,
+            ImportPreferences(start_date=dt.date(2025, 6, 1), enabled_stats=frozenset({"hrv"})),
+        )
+        ensure_config(settings)
+        raw = read_config(settings)
+        assert raw["data"]["sleep_start_date"] == "2025-06-01"
+        assert raw["enabled_stats"]["hrv"] is True
+        assert raw["enabled_stats"]["sleep"] is False
+
+    def test_saving_the_scope_does_not_lose_the_linked_account(self, settings: Settings) -> None:
+        ensure_config(settings, user="rider@example.com")
+        save_preferences(
+            settings,
+            ImportPreferences(start_date=dt.date(2025, 6, 1), enabled_stats=frozenset({"hrv"})),
+        )
+        ensure_config(settings)
+        assert read_config(settings)["credentials"]["user"] == "rider@example.com"

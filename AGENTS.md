@@ -43,6 +43,31 @@ is the owner's only way out of a schema mismatch in a container, and it never
 re-downloads. `/setup` shows the fault and the button only while there is one;
 `GET /sync/status` grew a `serving` block.
 
+**Owner-controlled import scope.** `preferences.py` persists the two knobs that
+decide how long a sync runs — the earliest date to import from, and which of the
+four downloadable statistics to fetch — to `import_preferences.json` under app
+data. `GARMIN_BACKFILL_START_DATE` only *seeds* the default now; once the owner
+saves, the file wins. `/setup` renders the form, a per-metric coverage table
+(rows held, the window covered, and the gap against the chosen floor) and a live
+progress line; `POST /setup/import` saves it and immediately re-renders
+`GarminConnectConfig.json`.
+
+**Backfill.** `download_plan()` only ever moves *forward* from a metric's newest
+row, so lowering the floor would otherwise be a no-op on any metric that already
+holds data. `backfill_plan()` is its complement — the older range each enabled
+metric is missing — and `POST /backfill` runs it through the normal
+import/analyze phases. A metric with **no** rows is deliberately excluded: an
+empty table already starts at the floor, so backfilling it would duplicate a
+normal sync at twice the cost. This is why the coverage table says "starts at
+your date on the next sync" rather than "complete" for an empty metric.
+
+**Progress.** `SyncEngine` owns a `SyncStep` behind a `threading.Lock` (written
+on the worker thread, read on the event loop) and hands the ingest port a
+`ProgressSink`. The engine labels each phase *before* handing off, so the page
+says something the instant a sync starts rather than staying blank until the
+adapter reaches a reportable step. `/sync/status` exposes `progress` and
+`coverage`; `/setup` polls it and reloads once the run ends.
+
 **Not built yet:** workouts, body battery (`daily_summary.bb_*`, available but
 with no spec type — it would go under vendor-extension metric ids), and any
 push/webhook ingest. There is still no full-reimport endpoint *other* than
@@ -244,6 +269,26 @@ imported only by `garmin/*`.
 - `GarminDbIngest` builds its DB handles **lazily**, precisely so that a corpus
   whose schema is too old to open can still be constructed — `rebuild()` has to
   exist in order to delete the files that would otherwise raise.
+
+**Import scope and progress.**
+
+- `config.py` is environment the operator sets and does **no I/O**;
+  `preferences.py` is state the owner edits and persists. Do not move either into
+  the other.
+- `parse_preferences` (owner input) is strict ISO 8601; `load_preferences`
+  (stored/env values) is lenient dateutil. Deliberate: dateutil reads
+  `"03/01/2024"` as March 1st on a US default, and a start date silently three
+  months off is not noticed until the download has already run.
+- An unknown statistic is **refused** from form input and **dropped** from the
+  stored file. Passing one through reaches `Statistics.from_string` deep inside
+  GarminDB, far from anything that could explain it.
+- `STAT_TABLES` in `garmin/ingest.py` is the single source of truth binding a
+  statistic to its table. `download_plan` and `stat_coverage` both read it, so
+  the gap shown on the page is measured against the same table the downloader
+  uses to pick its range. Keep it that way or the two will disagree.
+- The progress sink must never be the thing that fails a sync. It is
+  fire-and-forget by design, and `run_once` clears the step in a `finally` — a
+  progress line left standing reads as a sync that never finished.
 
 **Sync.**
 

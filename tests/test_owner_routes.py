@@ -1,3 +1,5 @@
+import datetime as dt
+import threading
 import time
 from collections.abc import Iterator
 
@@ -8,6 +10,13 @@ from litestar.testing import TestClient
 from garmin_health.app import create_app
 from garmin_health.auth import GarminAuthenticator
 from garmin_health.config import Settings
+from garmin_health.garmin_config import read_config
+from garmin_health.preferences import DOWNLOADABLE_STATS
+from garmin_health.preferences import STAT_LABELS
+from garmin_health.preferences import ImportPreferences
+from garmin_health.preferences import load_preferences
+from garmin_health.preferences import save_preferences
+from garmin_health.routes.owner import _join_names
 from garmin_health.sync import TableStat
 from tests.fakes import FakeIngest
 from tests.fakes import RecordingFactory
@@ -414,3 +423,234 @@ class TestSetupShowsSyncState:
         )
         with TestClient(app=app) as client:
             assert "action='/sync'" not in client.get("/setup", headers=OWNER).text
+
+
+class TestImportScopeControls:
+    """The owner sets how far back to go and which metrics to fetch, from the page."""
+
+    def test_the_form_is_rendered_with_the_current_scope(self, settings: Settings) -> None:
+        save_preferences(
+            settings,
+            ImportPreferences(
+                start_date=dt.date(2024, 3, 1), enabled_stats=frozenset({"sleep", "hrv"})
+            ),
+        )
+        client, _ = linked_client(settings)
+        with client:
+            page = client.get("/setup", headers=OWNER).text
+
+        assert "value='2024-03-01'" in page
+        assert "name='stats' value='sleep' checked" in page
+        assert "name='stats' value='hrv' checked" in page
+        assert "name='stats' value='monitoring' checked" not in page
+
+    def test_every_downloadable_metric_gets_a_checkbox(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            page = client.get("/setup", headers=OWNER).text
+        for stat in DOWNLOADABLE_STATS:
+            assert f"value='{stat}'" in page
+
+    def test_saving_the_scope_persists_it(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            response = client.post(
+                "/setup/import",
+                data={"start_date": "2025-02-01", "stats": ["sleep", "rhr"]},
+                headers=OWNER,
+                follow_redirects=False,
+            )
+        assert response.status_code == 303
+        saved = load_preferences(settings)
+        assert saved.start_date == dt.date(2025, 2, 1)
+        assert saved.enabled_stats == frozenset({"sleep", "rhr"})
+
+    def test_the_scope_reaches_the_garmindb_config(self, settings: Settings) -> None:
+        """Saving has to change what the next sync actually downloads, not just
+        what the page displays."""
+        client, _ = linked_client(settings)
+        with client:
+            client.post(
+                "/setup/import",
+                data={"start_date": "2025-02-01", "stats": ["sleep"]},
+                headers=OWNER,
+            )
+        raw = read_config(settings)
+        assert raw["data"]["sleep_start_date"] == "2025-02-01"
+        assert raw["enabled_stats"]["sleep"] is True
+        assert raw["enabled_stats"]["monitoring"] is False
+
+    def test_deselecting_everything_pauses_imports(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            client.post("/setup/import", data={"start_date": "2025-02-01"}, headers=OWNER)
+        assert load_preferences(settings).enabled_stats == frozenset()
+
+    def test_the_page_says_so_when_nothing_is_selected(self, settings: Settings) -> None:
+        save_preferences(
+            settings,
+            ImportPreferences(start_date=dt.date(2024, 3, 1), enabled_stats=frozenset()),
+        )
+        client, _ = linked_client(settings)
+        with client:
+            page = client.get("/setup", headers=OWNER).text
+        assert "no metrics" in page.lower()
+
+    def test_a_bad_date_is_explained_and_nothing_is_saved(self, settings: Settings) -> None:
+        before = load_preferences(settings)
+        client, _ = linked_client(settings)
+        with client:
+            response = client.post(
+                "/setup/import",
+                data={"start_date": "whenever", "stats": ["sleep"]},
+                headers=OWNER,
+            )
+        assert response.status_code == 400
+        assert "YYYY-MM-DD" in response.text
+        assert load_preferences(settings) == before
+
+    def test_a_future_date_is_refused(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            response = client.post(
+                "/setup/import",
+                data={"start_date": "2099-01-01", "stats": ["sleep"]},
+                headers=OWNER,
+            )
+        assert response.status_code == 400
+        assert "future" in response.text.lower()
+
+    def test_the_scope_form_is_owner_gated(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            assert (
+                client.post("/setup/import", data={"start_date": "2025-01-01"}).status_code == 401
+            )
+
+
+class TestCoverageDisplay:
+    def test_each_metric_reports_what_it_holds(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            page = client.get("/setup", headers=OWNER).text
+        assert "2024-03-01" in page
+        assert "2026-09-10" in page
+        for label in STAT_LABELS.values():
+            assert label in page
+
+    def test_a_metric_short_of_the_floor_offers_a_backfill(self, settings: Settings) -> None:
+        """The whole reason the date control is not a no-op: incremental downloads
+        only ever move forward from the newest row."""
+        client, _ = linked_client(settings)
+        with client:
+            page = client.get("/setup", headers=OWNER).text
+        assert "action='/backfill'" in page
+        assert "1,521" in page
+
+    def test_a_complete_metric_offers_no_backfill(self, settings: Settings) -> None:
+        client, _ = linked_client(settings, FakeIngest(coverage_gap=False))
+        with client:
+            page = client.get("/setup", headers=OWNER).text
+        assert "action='/backfill'" not in page
+
+    def test_coverage_is_exposed_as_json(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            body = client.get("/sync/status", headers=OWNER).json()
+        sleep = next(c for c in body["coverage"] if c["stat"] == "sleep")
+        assert sleep["rows"] == 42
+        assert sleep["missing_days"] == 1521
+
+
+class TestBackfillTrigger:
+    def test_it_starts_a_backfill(self, settings: Settings) -> None:
+        client, ingest = linked_client(settings)
+        with client:
+            response = client.post("/backfill", headers=OWNER)
+            assert response.status_code == 202
+            assert response.json()["started"] is True
+            wait_for_sync(client)
+        assert "backfill" in ingest.calls
+
+    def test_it_is_refused_while_unlinked(self, settings: Settings) -> None:
+        """It really does talk to Garmin, unlike a rebuild."""
+        app = create_app(
+            settings=settings,
+            authenticator=GarminAuthenticator(
+                settings, garmin_factory=RecordingFactory(needs_mfa=False)
+            ),
+            ingest_factory=lambda: FakeIngest(),
+        )
+        with TestClient(app=app) as unlinked:
+            assert unlinked.post("/backfill", headers=OWNER).status_code == 409
+
+    def test_it_is_owner_gated(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            assert client.post("/backfill").status_code == 401
+
+
+class TestProgressDisplay:
+    def test_the_page_shows_the_step_a_running_sync_is_on(self, settings: Settings) -> None:
+        gate = threading.Event()
+        client, _ = linked_client(settings, FakeIngest(block_on=gate))
+        try:
+            with client:
+                client.post("/sync", headers=OWNER)
+                for _ in range(100):
+                    if client.get("/sync/status", headers=OWNER).json()["progress"]:
+                        break
+                    time.sleep(0.02)
+                status = client.get("/sync/status", headers=OWNER).json()
+                label = status["progress"]["label"]
+                assert "Garmin" in label
+                assert label in client.get("/setup", headers=OWNER).text
+        finally:
+            gate.set()
+
+    def test_the_status_endpoint_reports_no_progress_while_idle(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            assert client.get("/sync/status", headers=OWNER).json()["progress"] is None
+
+
+class TestCoverageWording:
+    """The table is the only place the owner learns what is actually there."""
+
+    def test_a_metric_holding_nothing_is_not_called_complete(self, settings: Settings) -> None:
+        """has_gap is False for an empty metric because a normal sync already
+        starts it at the floor -- but "complete" would be a plain lie."""
+        client, _ = linked_client(settings, FakeIngest(empty_metrics=True))
+        with client:
+            page = client.get("/setup", headers=OWNER).text
+        assert "complete" not in page
+        assert "starts at your date" in page
+        assert "nothing yet" in page
+
+    def test_a_paused_metric_that_holds_data_says_paused(self, settings: Settings) -> None:
+        """Switching a metric off does not delete what it already downloaded, and
+        the row still has to say what is there."""
+        client, _ = linked_client(settings, FakeIngest(disabled_metrics=True))
+        with client:
+            page = client.get("/setup", headers=OWNER).text
+        assert "paused" in page
+        assert "42 rows" in page
+        assert "action='/backfill'" not in page
+
+    def test_the_gap_summary_names_the_metrics_as_a_sentence(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            page = client.get("/setup", headers=OWNER).text
+        assert "Heart rate, Sleep, Resting heart rate and Heart rate variability" in page
+
+    @pytest.mark.parametrize(
+        ("names", "expected"),
+        [
+            ([], ""),
+            (["Sleep"], "Sleep"),
+            (["Sleep", "HRV"], "Sleep and HRV"),
+            (["Sleep", "HRV", "Heart rate"], "Sleep, HRV and Heart rate"),
+        ],
+    )
+    def test_names_are_joined_as_prose(self, names: list[str], expected: str) -> None:
+        assert _join_names(names) == expected

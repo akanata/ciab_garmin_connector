@@ -20,6 +20,9 @@ import dateutil.parser
 from garmindb import GarminConnectConfigManager
 
 from garmin_health.config import Settings
+from garmin_health.preferences import DOWNLOADABLE_STATS
+from garmin_health.preferences import ImportPreferences
+from garmin_health.preferences import load_preferences
 
 REQUIRED_SECTIONS = ("db", "garmin", "credentials", "data", "directories", "enabled_stats")
 
@@ -28,13 +31,20 @@ class InvalidGarminConfig(Exception):
     """The GarminDB config is absent or malformed."""
 
 
-def render_config(settings: Settings, *, user: str = "") -> dict[str, Any]:
+def render_config(
+    settings: Settings, *, user: str = "", preferences: ImportPreferences | None = None
+) -> dict[str, Any]:
     """Build the config document GarminDB will read.
 
     The password is deliberately always empty. We perform the Garmin login
     ourselves and hand GarminDB the resulting ``garmin_tokens.json``, so the
     owner's plaintext password never has to be written to disk at all.
+
+    ``preferences`` is the owner's saved import scope; the environment-seeded
+    defaults are used when nothing has been saved yet.
     """
+    preferences = preferences or ImportPreferences.defaults(settings)
+    start = preferences.start_date_text
     return {
         "db": {"type": "sqlite"},
         "garmin": {"domain": settings.garmin_domain},
@@ -45,11 +55,11 @@ def render_config(settings: Settings, *, user: str = "") -> dict[str, Any]:
             "password_file": None,
         },
         "data": {
-            "sleep_start_date": settings.backfill_start_date,
-            "monitoring_start_date": settings.backfill_start_date,
-            "rhr_start_date": settings.backfill_start_date,
-            "hrv_start_date": settings.backfill_start_date,
-            "weight_start_date": settings.backfill_start_date,
+            "sleep_start_date": start,
+            "monitoring_start_date": start,
+            "rhr_start_date": start,
+            "hrv_start_date": start,
+            "weight_start_date": start,
             "download_latest_activities": 0,
             "download_all_activities": 0,
         },
@@ -60,13 +70,14 @@ def render_config(settings: Settings, *, user: str = "") -> dict[str, Any]:
             "relative_to_home": False,
             "base_dir": str(settings.health_data_dir.resolve()),
         },
-        # Activities are by far the slowest download and are out of scope, as are
-        # steps/itime/weight for this iteration.
+        # Every key GarminDB knows has to be present: an absent enabled_stats
+        # block makes GarminConnectConfigManager default *every* statistic to
+        # True, including activities -- by far the slowest download and one we
+        # have no branch for. The four the owner can choose from come from their
+        # saved scope; the rest are unconditionally off because nothing here
+        # implements them.
         "enabled_stats": {
-            "monitoring": True,
-            "sleep": True,
-            "rhr": True,
-            "hrv": True,
+            **{name: preferences.is_enabled(name) for name in DOWNLOADABLE_STATS},
             "steps": False,
             "itime": False,
             "weight": False,
@@ -158,11 +169,20 @@ def config_user(settings: Settings) -> str | None:
     return user or None
 
 
-def ensure_config(settings: Settings, *, user: str | None = None) -> Path:
-    """Write a valid config, preserving the recorded user unless one is given."""
+def ensure_config(
+    settings: Settings, *, user: str | None = None, preferences: ImportPreferences | None = None
+) -> Path:
+    """Write a valid config, preserving the recorded user unless one is given.
+
+    Re-rendered from the owner's saved scope every time, so a scope change takes
+    effect on the next sync without anyone having to remember to rewrite this
+    file separately.
+    """
     if user is None:
         user = config_user(settings) or ""
-    document = render_config(settings, user=user)
+    document = render_config(
+        settings, user=user, preferences=preferences or load_preferences(settings)
+    )
     validate_config(document)
     _atomic_write(settings.garmin_config_file, json.dumps(document, indent=4))
     return settings.garmin_config_file

@@ -21,10 +21,12 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import time
 from collections.abc import Callable
 from collections.abc import Mapping
 from enum import StrEnum
 from threading import Event
+from threading import Lock
 from typing import Any
 from typing import Protocol
 
@@ -36,6 +38,11 @@ from garmin_health.auth import LinkState
 from garmin_health.config import Settings
 
 logger = logging.getLogger(__name__)
+
+# How long /setup may show a cached picture of what each metric holds. Short
+# enough that a finished sync shows up on the next refresh, long enough that
+# holding the page open does not rebuild an ingest every few seconds.
+COVERAGE_TTL_SECONDS = 30.0
 
 
 class SyncPhase(StrEnum):
@@ -61,14 +68,84 @@ class TableStat:
         return {"rows": self.rows, "latest": self.latest}
 
 
+ProgressSink = Callable[[str, int, int], None]
+"""``(what is happening now, steps finished, steps total)``. ``total`` 0 = unknown."""
+
+
+def _no_progress(label: str, done: int, total: int) -> None:
+    """Default sink, so the port can be driven without an engine attached."""
+
+
+@attrs.frozen
+class StatCoverage:
+    """How much history one statistic actually holds, against what was asked for.
+
+    ``earliest``/``latest`` are ISO **dates** of the stored naive values -- they
+    are wall clocks on GarminDB's own clock, not instants, and converting them is
+    ``TimeZonePolicy``'s job rather than a status endpoint's.
+    """
+
+    stat: str
+    enabled: bool
+    rows: int
+    earliest: str | None
+    latest: str | None
+    floor: str
+
+    @property
+    def missing_days(self) -> int:
+        """Days between the configured floor and the oldest row we hold.
+
+        Zero for an empty metric: a normal sync already starts at the floor when a
+        table has no rows, so a backfill there would just duplicate "Sync now".
+        """
+        if self.rows == 0 or self.earliest is None:
+            return 0
+        try:
+            earliest = dt.date.fromisoformat(self.earliest[:10])
+            floor = dt.date.fromisoformat(self.floor[:10])
+        except ValueError:  # pragma: no cover - both are rendered by us
+            return 0
+        return max((earliest - floor).days, 0)
+
+    @property
+    def has_gap(self) -> bool:
+        return self.missing_days > 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "stat": self.stat,
+            "enabled": self.enabled,
+            "rows": self.rows,
+            "earliest": self.earliest,
+            "latest": self.latest,
+            "floor": self.floor,
+            "missing_days": self.missing_days,
+        }
+
+
+@attrs.frozen
+class SyncStep:
+    """What the worker thread is doing right now."""
+
+    label: str
+    done: int = 0
+    total: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"label": self.label, "done": self.done, "total": self.total}
+
+
 class Ingest(Protocol):
     """The GarminDB-facing port. Every method is synchronous and blocking."""
 
     def table_stats(self) -> dict[str, TableStat]: ...
-    def download(self, stop: Event) -> None: ...
-    def import_(self, stop: Event) -> None: ...
+    def stat_coverage(self) -> dict[str, StatCoverage]: ...
+    def download(self, stop: Event, progress: ProgressSink = ...) -> None: ...
+    def backfill(self, stop: Event, progress: ProgressSink = ...) -> None: ...
+    def import_(self, stop: Event, progress: ProgressSink = ...) -> None: ...
     def analyze(self) -> None: ...
-    def rebuild(self, stop: Event) -> None: ...
+    def rebuild(self, stop: Event, progress: ProgressSink = ...) -> None: ...
 
 
 @attrs.frozen
@@ -164,28 +241,78 @@ class SyncEngine:
         self._stop = Event()
         self._last: SyncReport | None = None
         self._task: asyncio.Task[SyncReport | None] | None = None
+        # Written from the worker thread, read from the event loop, so it needs a
+        # real lock rather than relying on the GIL for a two-field update.
+        self._step_lock = Lock()
+        self._step: SyncStep | None = None
+        self._coverage: dict[str, StatCoverage] | None = None
+        self._coverage_at = 0.0
 
     @property
     def is_running(self) -> bool:
         return self._lock.locked()
+
+    def _report_progress(self, label: str, done: int = 0, total: int = 0) -> None:
+        """The sink handed to the ingest port. Called on the worker thread."""
+        with self._step_lock:
+            self._step = SyncStep(label=label, done=done, total=total)
+        logger.info("Sync progress: %s", label)
+
+    def _clear_progress(self) -> None:
+        with self._step_lock:
+            self._step = None
+
+    @property
+    def step(self) -> SyncStep | None:
+        with self._step_lock:
+            return self._step
+
+    async def coverage(self, *, refresh: bool = False) -> dict[str, StatCoverage]:
+        """Per-metric history, behind a short TTL.
+
+        Building an ingest re-renders GarminConnectConfig.json and opens both
+        databases, so ``/setup`` must not pay that on every refresh. The cache is
+        dropped outright after a sync, which is the only thing that changes the
+        answer materially.
+        """
+        now = time.monotonic()
+        if (
+            not refresh
+            and self._coverage is not None
+            and now - self._coverage_at < COVERAGE_TTL_SECONDS
+        ):
+            return self._coverage
+        coverage: dict[str, StatCoverage]
+        try:
+            coverage = await self._in_thread(self._ingest_factory().stat_coverage)
+        except Exception as exc:
+            # A stale schema makes this raise, and /setup still has to render --
+            # it is where the owner goes to press Rebuild.
+            logger.warning("Could not read per-metric coverage: %s", exc)
+            coverage = {}
+        self._coverage = coverage
+        self._coverage_at = now
+        return coverage
 
     def request_stop(self) -> None:
         """Ask an in-flight sync to stop at its next phase or stat boundary."""
         self._stop.set()
 
     def status(self) -> dict[str, Any]:
+        step = self.step
         return {
             "link_state": self._auth.status().state.value,
             "running": self.is_running,
             "interval_seconds": self._settings.sync_interval_seconds,
+            "progress": step.as_dict() if step else None,
             "last_sync": self._last.as_dict() if self._last else None,
         }
 
-    async def trigger(self) -> bool:
+    async def trigger(self, *, backfill: bool = False) -> bool:
         """Start a sync in the background. False if one is already in flight."""
         if self.is_running:
             return False
-        self._task = asyncio.create_task(self.run_once())
+        self._task = asyncio.create_task(self.run_once(backfill=backfill))
         self._task.add_done_callback(self._log_task_result)
         # Let the task reach its first await so is_running is true on return,
         # which is what makes a second POST /sync see the in-flight run.
@@ -214,8 +341,13 @@ class SyncEngine:
         if exception is not None:  # pragma: no cover - run_once catches its own
             logger.error("Background sync task failed: %s", exception)
 
-    async def run_once(self) -> SyncReport | None:
+    async def run_once(self, *, backfill: bool = False) -> SyncReport | None:
         """Run one download -> import -> analyze cycle.
+
+        With ``backfill=True`` the download phase fetches the *older* range each
+        metric is missing against the configured floor, instead of the newer range
+        it is missing against today. Everything after that is identical, because
+        the importers only care that files landed on disk.
 
         Returns ``None`` if the account is not linked or a sync is already running.
         Phase failures are recorded on the report rather than raised: the caller is
@@ -241,15 +373,30 @@ class SyncEngine:
             try:
                 before = await self._in_thread(ingest.table_stats)
                 phase = SyncPhase.DOWNLOAD
-                await self._in_thread(ingest.download, self._stop)
+                # A phase label of our own before handing off, so the page says
+                # something the instant a sync starts rather than staying blank
+                # until the adapter happens to reach its first reportable step.
+                self._report_progress(
+                    "Fetching older history from Garmin"
+                    if backfill
+                    else "Fetching new data from Garmin"
+                )
+                fetch = ingest.backfill if backfill else ingest.download
+                await self._in_thread(fetch, self._stop, self._report_progress)
                 phase = SyncPhase.IMPORT
-                await self._in_thread(ingest.import_, self._stop)
+                self._report_progress("Importing downloaded files")
+                await self._in_thread(ingest.import_, self._stop, self._report_progress)
                 phase = SyncPhase.ANALYZE
+                self._report_progress("Building summaries")
                 await self._in_thread(ingest.analyze)
                 phase = None
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
                 logger.exception("Sync failed during %s", phase)
+            finally:
+                # A progress line left standing reads as a sync that never
+                # finished, which is worse than no progress line at all.
+                self._clear_progress()
 
             try:
                 after = await self._in_thread(ingest.table_stats)
@@ -310,11 +457,14 @@ class SyncEngine:
                 ingest = self._ingest_factory()
 
             try:
-                await self._in_thread(ingest.rebuild, self._stop)
+                self._report_progress("Rebuilding the local databases")
+                await self._in_thread(ingest.rebuild, self._stop, self._report_progress)
                 phase = None
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
                 logger.exception("Rebuild failed")
+            finally:
+                self._clear_progress()
 
             try:
                 after = await self._in_thread(ingest.table_stats)
@@ -336,6 +486,7 @@ class SyncEngine:
 
     def _notify_corpus_changed(self) -> None:
         """A failing callback must never turn a good sync into a failed one."""
+        self._coverage = None
         if self._on_corpus_changed is None:
             return
         try:

@@ -76,6 +76,16 @@ class Settings:
         return self.config_dir / "garmin_tokens.json"
 
     @property
+    def preferences_file(self) -> Path:
+        """Owner-editable import scope (how far back, which metrics).
+
+        Under app data rather than in the GarminDb config directory because it is
+        ours, not GarminDB's, and it has to survive a container restart -- a scope
+        the owner re-enters after every deploy is not a setting.
+        """
+        return self.app_data_dir / "import_preferences.json"
+
+    @property
     def health_data_dir(self) -> Path:
         """GarminDB's base_dir: the raw JSON/FIT corpus plus the SQLite DBs."""
         return self.app_data_dir / "HealthData"

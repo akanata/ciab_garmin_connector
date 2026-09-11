@@ -21,6 +21,7 @@ from typing import Any
 
 from garminconnect import GarminConnectAuthenticationError
 
+from garmin_health.sync import StatCoverage
 from garmin_health.sync import TableStat
 
 
@@ -118,7 +119,13 @@ class FakeIngest:
         stats_sequence: list[dict[str, Any]] | None = None,
         fail_on: str | None = None,
         block_on: Any | None = None,
+        coverage_gap: bool = True,
+        empty_metrics: bool = False,
+        disabled_metrics: bool = False,
     ) -> None:
+        self._coverage_gap = coverage_gap
+        self._empty_metrics = empty_metrics
+        self._disabled_metrics = disabled_metrics
         default = {"sleep": TableStat(rows=1, latest="2026-06-14T23:00:00")}
         self._stats_sequence = stats_sequence or [default, default]
         self._fail_on = fail_on
@@ -142,19 +149,66 @@ class FakeIngest:
         index = min(seen - 1, len(self._stats_sequence) - 1)
         return dict(self._stats_sequence[index])
 
-    def download(self, stop: Any) -> None:
+    def stat_coverage(self) -> dict[str, Any]:
+        self._record("stat_coverage")
+        return {
+            stat: StatCoverage(
+                stat=stat,
+                enabled=not self._disabled_metrics,
+                rows=0 if self._empty_metrics else 42,
+                earliest=None if self._empty_metrics else "2024-03-01",
+                latest=None if self._empty_metrics else "2026-09-10",
+                floor="2020-01-01" if self._coverage_gap else "2024-03-01",
+            )
+            for stat in ("monitoring", "sleep", "rhr", "hrv")
+        }
+
+    def download(self, stop: Any, progress: Any = None) -> None:
         self.stop_event = stop
         if self._block_on is not None:
             self._block_on.wait(5)
         self._record("download")
 
-    def import_(self, stop: Any) -> None:
+    def backfill(self, stop: Any, progress: Any = None) -> None:
+        self.stop_event = stop
+        self._record("backfill")
+
+    def import_(self, stop: Any, progress: Any = None) -> None:
         self.stop_event = stop
         self._record("import")
 
     def analyze(self) -> None:
         self._record("analyze")
 
-    def rebuild(self, stop: Any) -> None:
+    def rebuild(self, stop: Any, progress: Any = None) -> None:
         self.stop_event = stop
         self._record("rebuild")
+
+
+class ReportingIngest(FakeIngest):
+    """A FakeIngest that emits progress the way the real adapter does.
+
+    ``seen_from`` is called after each report so a test can observe what the
+    engine's status endpoint would have shown at that instant.
+    """
+
+    STATS = ("monitoring", "sleep", "rhr", "hrv")
+
+    def __init__(self, *, seen_from: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._seen_from = seen_from
+
+    def download(self, stop: Any, progress: Any = None) -> None:
+        self.stop_event = stop
+        for index, stat in enumerate(self.STATS):
+            if progress is not None:
+                progress(f"Downloading {stat} (452 days)", index, len(self.STATS))
+            self._seen_from()
+        self._record("download")
+
+    def import_(self, stop: Any, progress: Any = None) -> None:
+        self.stop_event = stop
+        if progress is not None:
+            progress("Importing downloaded files", 0, 0)
+        self._seen_from()
+        self._record("import")

@@ -17,12 +17,14 @@ import pytest
 from garmin_health.auth import GarminAuthenticator
 from garmin_health.auth import LinkState
 from garmin_health.config import Settings
+from garmin_health.sync import StatCoverage
 from garmin_health.sync import SyncEngine
 from garmin_health.sync import SyncPhase
 from garmin_health.sync import TableStat
 from garmin_health.sync import incremental_range
 from tests.fakes import FakeIngest
 from tests.fakes import RecordingFactory
+from tests.fakes import ReportingIngest
 
 TODAY = dt.date(2026, 6, 15)
 
@@ -455,3 +457,175 @@ class TestRebuild:
         assert await engine.trigger() is True
         assert await engine.trigger_rebuild() is False
         engine.request_stop()
+
+
+class TestStatCoverage:
+    def test_a_gap_is_the_days_between_the_floor_and_the_oldest_row(self) -> None:
+        coverage = StatCoverage(
+            stat="sleep",
+            enabled=True,
+            rows=100,
+            earliest="2024-03-01",
+            latest="2026-09-10",
+            floor="2020-01-01",
+        )
+        assert coverage.missing_days == 1521
+        assert coverage.has_gap is True
+
+    def test_a_corpus_reaching_the_floor_has_no_gap(self) -> None:
+        coverage = StatCoverage(
+            stat="sleep",
+            enabled=True,
+            rows=100,
+            earliest="2020-01-01",
+            latest="2026-09-10",
+            floor="2020-01-01",
+        )
+        assert coverage.missing_days == 0
+        assert coverage.has_gap is False
+
+    def test_a_corpus_older_than_the_floor_has_no_gap(self) -> None:
+        """Raising the floor does not make already-downloaded history a problem."""
+        coverage = StatCoverage(
+            stat="sleep",
+            enabled=True,
+            rows=100,
+            earliest="2019-01-01",
+            latest="2026-09-10",
+            floor="2020-01-01",
+        )
+        assert coverage.missing_days == 0
+
+    def test_an_empty_metric_reports_no_gap(self) -> None:
+        """A normal sync already starts at the floor when a table is empty, so
+        offering a backfill here would be a button that duplicates Sync now."""
+        coverage = StatCoverage(
+            stat="sleep", enabled=True, rows=0, earliest=None, latest=None, floor="2020-01-01"
+        )
+        assert coverage.missing_days == 0
+        assert coverage.has_gap is False
+
+    def test_it_serializes_for_the_status_endpoint(self) -> None:
+        coverage = StatCoverage(
+            stat="sleep",
+            enabled=True,
+            rows=100,
+            earliest="2024-03-01",
+            latest="2026-09-10",
+            floor="2020-01-01",
+        )
+        assert coverage.as_dict() == {
+            "stat": "sleep",
+            "enabled": True,
+            "rows": 100,
+            "earliest": "2024-03-01",
+            "latest": "2026-09-10",
+            "floor": "2020-01-01",
+            "missing_days": 1521,
+        }
+
+
+class TestProgress:
+    async def test_no_progress_is_reported_while_idle(self, settings: Settings) -> None:
+        engine, _, _ = make_engine(settings)
+        assert engine.status()["progress"] is None
+
+    async def test_the_engine_reports_the_step_the_ingest_is_on(self, settings: Settings) -> None:
+        """The whole point: a multi-hour download is otherwise invisible outside
+        the container logs."""
+        seen: list[dict[str, object] | None] = []
+        ingest = ReportingIngest(seen_from=lambda: seen.append(engine.status()["progress"]))
+        engine, _, _ = make_engine(settings, ingest=ingest)  # type: ignore[arg-type]
+        await engine.run_once()
+
+        labels = [s["label"] for s in seen if s]
+        assert "Downloading sleep (452 days)" in labels
+        assert any(s and s["total"] == 4 for s in seen)
+
+    async def test_the_step_is_cleared_when_the_sync_ends(self, settings: Settings) -> None:
+        engine, _, _ = make_engine(settings)
+        await engine.run_once()
+        assert engine.status()["progress"] is None
+
+    async def test_the_step_is_cleared_after_a_failure_too(self, settings: Settings) -> None:
+        """A stuck progress line would read as a sync that never finished."""
+        engine, _, _ = make_engine(settings, ingest=FakeIngest(fail_on="import"))
+        await engine.run_once()
+        assert engine.status()["progress"] is None
+
+
+class TestBackfill:
+    async def test_it_downloads_the_older_range_then_imports(self, settings: Settings) -> None:
+        ingest = FakeIngest()
+        engine = SyncEngine(
+            settings=settings,
+            authenticator=linked_authenticator(settings),
+            ingest_factory=lambda: ingest,
+        )
+        report = await engine.run_once(backfill=True)
+        assert report is not None
+        assert report.error is None
+        assert ingest.calls == ["table_stats", "backfill", "import", "analyze", "table_stats"]
+
+    async def test_a_normal_sync_still_downloads_forward(self, settings: Settings) -> None:
+        engine, ingest, _ = make_engine(settings)
+        await engine.run_once()
+        assert "download" in ingest.calls
+        assert "backfill" not in ingest.calls
+
+    async def test_it_needs_a_linked_account(self, settings: Settings) -> None:
+        """Unlike a rebuild, this really does talk to Garmin."""
+        engine, _, _ = make_engine(settings, linked=False)
+        assert await engine.run_once(backfill=True) is None
+
+    async def test_triggering_it_reports_started(self, settings: Settings) -> None:
+        engine, ingest, _ = make_engine(settings)
+        assert await engine.trigger(backfill=True) is True
+        await engine.wait_for_idle()
+        assert "backfill" in ingest.calls
+
+    async def test_it_will_not_start_alongside_a_sync(self, settings: Settings) -> None:
+        engine, _, _ = make_engine(settings, ingest=FakeIngest(block_on=threading.Event()))
+        assert await engine.trigger() is True
+        assert await engine.trigger(backfill=True) is False
+        engine.request_stop()
+
+
+class TestCoverageReporting:
+    async def test_it_exposes_what_each_metric_holds(self, settings: Settings) -> None:
+        engine, _, _ = make_engine(settings)
+        coverage = await engine.coverage()
+        assert "sleep" in coverage
+        assert coverage["sleep"].rows == 42
+
+    async def test_it_is_cached_between_page_loads(self, settings: Settings) -> None:
+        """Building an ingest re-renders the GarminDB config and opens both
+        databases; /setup must not pay that on every refresh."""
+        built: list[int] = []
+
+        def factory() -> FakeIngest:
+            built.append(1)
+            return FakeIngest()
+
+        engine = SyncEngine(
+            settings=settings,
+            authenticator=linked_authenticator(settings),
+            ingest_factory=factory,
+        )
+        await engine.coverage()
+        await engine.coverage()
+        assert len(built) == 1
+
+    async def test_a_sync_invalidates_the_cache(self, settings: Settings) -> None:
+        engine, _, _ = make_engine(settings)
+        await engine.coverage()
+        await engine.run_once()
+        assert engine._coverage is None
+
+    async def test_a_broken_corpus_reports_no_coverage_rather_than_raising(
+        self, settings: Settings
+    ) -> None:
+        """A schema mismatch makes stat_coverage raise, and /setup still has to
+        render -- it is where the owner goes to press Rebuild."""
+        engine, _, _ = make_engine(settings, ingest=FakeIngest(fail_on="stat_coverage"))
+        assert await engine.coverage() == {}

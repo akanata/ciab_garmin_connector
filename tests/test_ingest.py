@@ -19,6 +19,9 @@ from garmin_health.config import Settings
 from garmin_health.garmin.ingest import Bindings
 from garmin_health.garmin.ingest import GarminDbIngest
 from garmin_health.garmin_config import ensure_config
+from garmin_health.preferences import DOWNLOADABLE_STATS
+from garmin_health.preferences import ImportPreferences
+from garmin_health.preferences import save_preferences
 from tests.fixtures import build_fixture
 
 
@@ -43,10 +46,18 @@ class FakeStep:
 
 
 class FakeDownload:
-    def __init__(self, log: list[str], *, login_ok: bool = True) -> None:
+    def __init__(
+        self,
+        log: list[str],
+        *,
+        login_ok: bool = True,
+        calls: list[tuple[str, dt.date, int]] | None = None,
+    ) -> None:
         self.log = log
         self.login_ok = login_ok
-        self.calls: list[tuple[str, dt.date, int]] = []
+        # _make_download() builds a fresh instance per call, so a shared list is
+        # how a test sees the ranges across a whole download or backfill.
+        self.calls = [] if calls is None else calls
         self.garmin = type("Adapter", (), {"mfa_prompt": lambda: "000000"})()
 
     def login(self) -> bool:
@@ -94,6 +105,7 @@ def make_ingest(
     files: int = 1,
     login_ok: bool = True,
     sleep_json_files: int | None = None,
+    calls: list[tuple[str, dt.date, int]] | None = None,
 ) -> GarminDbIngest:
     settings = Settings(app_data_dir=tmp_path / "appdata")
     ensure_config(settings, user="rider@example.com")
@@ -102,7 +114,7 @@ def make_ingest(
         return lambda *a, **k: FakeStep(name, log, files=count)
 
     bindings = Bindings(
-        download=lambda gc_config: FakeDownload(log, login_ok=login_ok),
+        download=lambda gc_config: FakeDownload(log, login_ok=login_ok, calls=calls),
         user_settings=step("user_settings"),
         personal_information=step("personal_information"),
         social_profile=step("social_profile"),
@@ -464,3 +476,148 @@ class TestRebuild:
         stop.set()
         ingest.rebuild(stop)
         assert "create_dynamic_views" not in log
+
+
+class TestStatCoverage:
+    def test_it_reports_every_selectable_metric_including_disabled_ones(
+        self, tmp_path: Path
+    ) -> None:
+        """The owner needs to see what a metric holds in order to decide whether
+        to switch it back on."""
+        settings = Settings(app_data_dir=tmp_path / "appdata")
+        save_preferences(
+            settings,
+            ImportPreferences(start_date=dt.date(2020, 1, 1), enabled_stats=frozenset({"sleep"})),
+        )
+        build_fixture(settings.health_data_dir, nights=3, heart_rate=True, resting_hr=True)
+        ingest = make_ingest(tmp_path, log=[])
+
+        coverage = ingest.stat_coverage()
+        assert set(coverage) == set(DOWNLOADABLE_STATS)
+        assert coverage["sleep"].enabled is True
+        assert coverage["monitoring"].enabled is False
+
+    def test_it_reports_the_window_each_metric_actually_covers(self, tmp_path: Path) -> None:
+        settings = Settings(app_data_dir=tmp_path / "appdata")
+        save_preferences(
+            settings,
+            ImportPreferences(
+                start_date=dt.date(2020, 1, 1), enabled_stats=frozenset(DOWNLOADABLE_STATS)
+            ),
+        )
+        build_fixture(settings.health_data_dir, nights=3)
+        ingest = make_ingest(tmp_path, log=[])
+
+        sleep = ingest.stat_coverage()["sleep"]
+        assert sleep.rows == 3
+        assert sleep.earliest == "2026-06-13"
+        assert sleep.latest == "2026-06-15"
+        assert sleep.floor == "2020-01-01"
+
+    def test_the_gap_is_measured_against_the_owners_floor(self, tmp_path: Path) -> None:
+        settings = Settings(app_data_dir=tmp_path / "appdata")
+        save_preferences(
+            settings,
+            ImportPreferences(
+                start_date=dt.date(2026, 6, 1), enabled_stats=frozenset(DOWNLOADABLE_STATS)
+            ),
+        )
+        build_fixture(settings.health_data_dir, nights=3)
+        sleep = make_ingest(tmp_path, log=[]).stat_coverage()["sleep"]
+        assert sleep.missing_days == 12
+        assert sleep.has_gap is True
+
+    def test_an_untouched_metric_reports_nothing_held_and_no_gap(self, tmp_path: Path) -> None:
+        settings = Settings(app_data_dir=tmp_path / "appdata")
+        build_fixture(settings.health_data_dir, nights=3)
+        rhr = make_ingest(tmp_path, log=[]).stat_coverage()["rhr"]
+        assert rhr.rows == 0
+        assert rhr.earliest is None
+        assert rhr.has_gap is False
+
+
+class TestBackfillDownload:
+    def _ingest_with(
+        self,
+        tmp_path: Path,
+        log: list[str],
+        calls: list[tuple[str, dt.date, int]],
+        *,
+        floor: dt.date,
+        stats: frozenset[str] = frozenset(DOWNLOADABLE_STATS),
+        login_ok: bool = True,
+    ) -> GarminDbIngest:
+        settings = Settings(app_data_dir=tmp_path / "appdata")
+        save_preferences(settings, ImportPreferences(start_date=floor, enabled_stats=stats))
+        build_fixture(settings.health_data_dir, nights=3)
+        return make_ingest(tmp_path, log=log, calls=calls, login_ok=login_ok)
+
+    def test_it_fetches_only_the_missing_older_range(self, tmp_path: Path) -> None:
+        """The forward range is what a normal sync already does. Re-fetching it
+        here would double the cost of every backfill."""
+        calls: list[tuple[str, dt.date, int]] = []
+        self._ingest_with(tmp_path, [], calls, floor=dt.date(2026, 6, 1)).backfill(Event())
+        assert ("sleep", dt.date(2026, 6, 1), 12) in calls
+
+    def test_a_metric_that_already_reaches_the_floor_is_skipped(self, tmp_path: Path) -> None:
+        calls: list[tuple[str, dt.date, int]] = []
+        self._ingest_with(tmp_path, [], calls, floor=dt.date(2026, 6, 13)).backfill(Event())
+        assert not [c for c in calls if c[0] == "sleep"]
+
+    def test_an_empty_metric_is_left_to_the_normal_sync(self, tmp_path: Path) -> None:
+        """rhr holds nothing, so incremental_range already starts it at the floor."""
+        calls: list[tuple[str, dt.date, int]] = []
+        self._ingest_with(tmp_path, [], calls, floor=dt.date(2026, 6, 1)).backfill(Event())
+        assert not [c for c in calls if c[0] == "rhr"]
+
+    def test_a_disabled_metric_is_never_backfilled(self, tmp_path: Path) -> None:
+        calls: list[tuple[str, dt.date, int]] = []
+        self._ingest_with(
+            tmp_path, [], calls, floor=dt.date(2026, 6, 1), stats=frozenset({"rhr"})
+        ).backfill(Event())
+        assert not [c for c in calls if c[0] == "sleep"]
+
+    def test_it_logs_in_before_fetching_anything(self, tmp_path: Path) -> None:
+        log: list[str] = []
+        self._ingest_with(tmp_path, log, [], floor=dt.date(2026, 6, 1)).backfill(Event())
+        assert log[0] == "login"
+
+    def test_a_failed_login_is_fatal_rather_than_a_quiet_no_op(self, tmp_path: Path) -> None:
+        ingest = self._ingest_with(tmp_path, [], [], floor=dt.date(2026, 6, 1), login_ok=False)
+        with pytest.raises(RuntimeError, match="log in"):
+            ingest.backfill(Event())
+
+    def test_a_stop_request_ends_it_between_metrics(self, tmp_path: Path) -> None:
+        calls: list[tuple[str, dt.date, int]] = []
+        ingest = self._ingest_with(tmp_path, [], calls, floor=dt.date(2026, 6, 1))
+        stop = Event()
+        stop.set()
+        ingest.backfill(stop)
+        assert calls == []
+
+
+class TestProgressReporting:
+    def test_the_download_names_the_metric_and_the_span(self, tmp_path: Path) -> None:
+        """A multi-hour download is otherwise invisible outside the logs."""
+        steps: list[tuple[str, int, int]] = []
+        ingest = make_ingest(tmp_path, log=[])
+        ingest.download(Event(), lambda label, done, total: steps.append((label, done, total)))
+
+        labels = [s[0].lower() for s in steps]
+        assert any("sleep" in label for label in labels)
+        assert any("days" in label for label in labels)
+        assert all(total == len(DOWNLOADABLE_STATS) for _, _, total in steps)
+        assert [done for _, done, _ in steps] == sorted(done for _, done, _ in steps)
+
+    def test_the_import_reports_each_phase(self, tmp_path: Path) -> None:
+        steps: list[str] = []
+        make_ingest(tmp_path, log=[]).import_(
+            Event(), lambda label, done, total: steps.append(label)
+        )
+        assert any("profile" in s.lower() for s in steps)
+        assert any("sleep" in s.lower() for s in steps)
+
+    def test_progress_is_optional_so_the_port_works_unattached(self, tmp_path: Path) -> None:
+        log: list[str] = []
+        make_ingest(tmp_path, log=log).import_(Event())
+        assert "rhr_data" in log

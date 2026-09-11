@@ -10,10 +10,12 @@ is a JSON API with one setup page, not a frontend.
 
 from __future__ import annotations
 
+import datetime as dt
 from html import escape
 from typing import Annotated
 from typing import Any
 
+import attrs
 from litestar import Router
 from litestar import get
 from litestar import post
@@ -26,6 +28,7 @@ from litestar.exceptions import NotAuthorizedException
 from litestar.handlers.base import BaseRouteHandler
 from litestar.params import Body
 from litestar.response import Redirect
+from litestar.response import Response
 from litestar.status_codes import HTTP_202_ACCEPTED
 from litestar.status_codes import HTTP_303_SEE_OTHER
 from litestar.status_codes import HTTP_409_CONFLICT
@@ -34,7 +37,18 @@ from garmin_health.auth import AuthError
 from garmin_health.auth import AuthStatus
 from garmin_health.auth import GarminAuthenticator
 from garmin_health.auth import LinkState
+from garmin_health.garmin_config import ensure_config
+from garmin_health.preferences import DOWNLOADABLE_STATS
+from garmin_health.preferences import STAT_DETAIL
+from garmin_health.preferences import STAT_LABELS
+from garmin_health.preferences import ImportPreferences
+from garmin_health.preferences import InvalidPreferences
+from garmin_health.preferences import load_preferences
+from garmin_health.preferences import parse_preferences
+from garmin_health.preferences import save_preferences
+from garmin_health.sync import StatCoverage
 from garmin_health.sync import SyncEngine
+from garmin_health.sync import SyncStep
 
 PASSWORD_NOTICE = (
     "Garmin does not offer a consent-based API outside its developer portal, so linking "
@@ -76,6 +90,31 @@ def _describe_last_sync(engine: SyncEngine) -> str:
     return f"Last sync finished at {when} ({rows} rows held)."
 
 
+@attrs.frozen
+class PageView:
+    """Everything /setup renders, assembled by the handler and passed down whole.
+
+    A single value object rather than eight positional arguments: the page grew
+    three independent concerns (linking, import scope, corpus coverage) and a
+    render signature that long is one transposed argument away from a wrong page.
+    """
+
+    status: AuthStatus
+    sync_summary: str
+    preferences: ImportPreferences
+    coverage: list[StatCoverage] = attrs.field(factory=list)
+    step: SyncStep | None = None
+    error: str | None = None
+    scope_error: str | None = None
+    serving_fault: str | None = None
+    today: dt.date = attrs.field(factory=dt.date.today)
+
+    @property
+    def gapped(self) -> list[StatCoverage]:
+        """Enabled metrics holding less history than the owner asked for."""
+        return [c for c in self.coverage if c.enabled and c.has_gap]
+
+
 def _serving_fault(state: State) -> str | None:
     """The serving layer's fault, if it has one.
 
@@ -104,6 +143,18 @@ BUSY_SCRIPT = (
     "var s=document.getElementById('busy');"
     "if(s){s.textContent=m;s.hidden=false;}"
     "});"
+    # Poll while a run is in flight so the step line stays current, then reload
+    # once, so the coverage table and summary are rebuilt server-side rather than
+    # duplicated in JavaScript. Pure enhancement: without it the page still shows
+    # the step it was rendered with, and a refresh still updates everything.
+    "(function(){var el=document.getElementById('step');if(!el)return;var ran=el.hidden?false:true;"
+    "function tick(){fetch('/sync/status',{headers:{'accept':'application/json'}})"
+    ".then(function(r){return r.ok?r.json():null}).then(function(s){if(!s)return;"
+    "if(s.progress){ran=true;el.hidden=false;"
+    "el.textContent=s.progress.label+(s.progress.total?' ('+s.progress.done+' of '+s.progress.total+')':'');}"
+    "else if(ran){location.reload();return;}else{el.hidden=true;}"
+    "setTimeout(tick,3000);}).catch(function(){setTimeout(tick,10000);});}"
+    "setTimeout(tick,3000);})();"
     # A bfcache back-navigation restores the DOM as it was left, which would
     # otherwise show a spinner over a permanently disabled button.
     "window.addEventListener('pageshow',function(ev){"
@@ -128,6 +179,18 @@ STYLE = (
     ".warning,.note{color:#555;font-size:.875rem}"
     ".busy{color:#555;font-size:.875rem;margin-top:.5rem}"
     ".sync{padding:.75rem;background:#eef6ff;border-left:3px solid #2563eb}"
+    ".step{padding:.75rem;background:#f1f5f9;border-left:3px solid #64748b;font-size:.9rem}"
+    "h2{font-size:1.1rem;margin-top:2rem;border-top:1px solid #e2e8f0;padding-top:1.25rem}"
+    "fieldset{border:1px solid #e2e8f0;margin:.75rem 0;padding:.5rem .75rem}"
+    "legend{font-size:.875rem;color:#555;padding:0 .25rem}"
+    "label.check{display:flex;gap:.5rem;align-items:flex-start;margin:.6rem 0}"
+    "label.check input{width:auto;margin:.2rem 0 0}"
+    "label.check .note{display:block;margin-top:.1rem}"
+    "table.coverage{border-collapse:collapse;width:100%;font-size:.9rem;margin-top:.5rem}"
+    "table.coverage th,table.coverage td{text-align:left;padding:.4rem .5rem;"
+    "border-bottom:1px solid #e2e8f0;vertical-align:top}"
+    "table.coverage thead th{font-size:.8rem;color:#555;font-weight:600}"
+    "td.empty{color:#777}td.gap{color:#b45309}td.ok{color:#15803d}"
     ".spinner{display:none;width:.85em;height:.85em;margin-right:.5em;vertical-align:-.1em;"
     "border:2px solid currentColor;border-right-color:transparent;border-radius:50%;"
     "animation:spin .7s linear infinite}"
@@ -142,12 +205,119 @@ def _button(label: str) -> str:
     return f"<button type='submit'><span class='spinner' aria-hidden='true'></span>{escape(label)}</button>"
 
 
-def _render(
-    status: AuthStatus,
-    error: str | None = None,
-    sync_summary: str = "",
-    serving_fault: str | None = None,
-) -> str:
+def _import_scope_form(view: PageView) -> str:
+    """The two knobs that decide how long a sync runs."""
+    prefs = view.preferences
+    boxes = []
+    for stat in DOWNLOADABLE_STATS:
+        checked = " checked" if prefs.is_enabled(stat) else ""
+        boxes.append(
+            f"<label class='check'><input type='checkbox' name='stats' value='{stat}'{checked}> "
+            f"{escape(STAT_LABELS[stat])}"
+            f"<span class='note'>{escape(STAT_DETAIL[stat])}</span></label>"
+        )
+
+    warning = ""
+    if not prefs.enabled_stats:
+        warning = (
+            "<p class='detail'>Imports are paused: no metrics are selected, so a sync will "
+            "download nothing.</p>"
+        )
+
+    error = (
+        f"<p class='error' role='alert'>{escape(view.scope_error)}</p>" if view.scope_error else ""
+    )
+    return (
+        "<h2>Import scope</h2>"
+        "<p class='note'>Both of these decide how long a sync takes. A full history of "
+        "continuous heart rate is by far the slowest thing to fetch.</p>"
+        + error
+        + "<form method='post' action='/setup/import' data-busy='Saving...'>"
+        "<label>Earliest date to import from"
+        f"<input type='date' name='start_date' value='{escape(prefs.start_date_text, quote=True)}'"
+        f" max='{view.today.isoformat()}' required></label>"
+        "<fieldset><legend>Metrics to import</legend>"
+        + "".join(boxes)
+        + "</fieldset>"
+        + _button("Save import scope")
+        + "</form>"
+        + warning
+    )
+
+
+def _join_names(names: list[str]) -> str:
+    """ "a", "a and b", "a, b and c" -- this is prose the owner reads."""
+    if len(names) <= 1:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def _coverage_table(view: PageView) -> str:
+    """What each metric actually holds, and whether it reaches the chosen floor."""
+    if not view.coverage:
+        return ""
+
+    rows = []
+    for entry in view.coverage:
+        if entry.rows == 0:
+            held = "<td class='empty'>nothing yet</td><td class='empty'>&mdash;</td>"
+        else:
+            held = (
+                f"<td>{entry.rows:,} rows</td>"
+                f"<td>{escape(str(entry.earliest))} &rarr; {escape(str(entry.latest))}</td>"
+            )
+        if not entry.enabled:
+            # It may well hold data from before it was switched off, so "paused"
+            # rather than "not imported" -- the Held column already says what is
+            # there, and this column is about what happens next.
+            note = "<td class='empty'>paused</td>"
+        elif entry.rows == 0:
+            # has_gap is deliberately False here (a normal sync already starts an
+            # empty metric at the floor), but "complete" would be a plain lie.
+            note = "<td class='empty'>starts at your date on the next sync</td>"
+        elif entry.has_gap:
+            note = f"<td class='gap'>{entry.missing_days:,} older days missing</td>"
+        else:
+            note = "<td class='ok'>complete</td>"
+        rows.append(f"<tr><th scope='row'>{escape(STAT_LABELS[entry.stat])}</th>{held}{note}</tr>")
+
+    backfill = ""
+    if view.gapped:
+        worst = max(c.missing_days for c in view.gapped)
+        names = _join_names([STAT_LABELS[c.stat] for c in view.gapped])
+        backfill = (
+            f"<p class='detail'>{escape(names)} hold less history than you asked for &mdash; up "
+            f"to {worst:,} days. A normal sync only ever moves forward from the newest reading, "
+            "so older history has to be fetched deliberately.</p>"
+            "<form method='post' action='/backfill' data-busy='Starting the backfill...'>"
+            + _button("Download the missing older history")
+            + "</form>"
+            "<p class='note'>This fetches only the missing older range, roughly a second per day "
+            "per metric. It runs in the background; this page does not need to stay open.</p>"
+        )
+
+    return (
+        "<h2>What has been imported</h2>"
+        "<table class='coverage'><thead><tr><th scope='col'>Metric</th>"
+        "<th scope='col'>Held</th><th scope='col'>Covering</th>"
+        "<th scope='col'>Against your start date</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>" + backfill
+    )
+
+
+def _progress_line(step: SyncStep | None) -> str:
+    """The live step, rendered server-side so it is there without JavaScript."""
+    if step is None:
+        return "<p class='step' id='step' hidden></p>"
+    counter = f" ({step.done} of {step.total})" if step.total else ""
+    return f"<p class='step' id='step'>{escape(step.label)}{escape(counter)}</p>"
+
+
+def _render(view: PageView) -> str:
+    status = view.status
+    error = view.error
+    sync_summary = view.sync_summary
+    serving_fault = view.serving_fault
     email = escape(status.email or "", quote=True)
 
     if status.state is LinkState.LINKED:
@@ -191,12 +361,15 @@ def _render(
     elif status.state is LinkState.LINKED:
         body.append(
             f"<p class='sync'>{sync_summary}</p>"
-            "<form method='post' action='/sync' data-busy='Starting a sync...'>"
+            + _progress_line(view.step)
+            + "<form method='post' action='/sync' data-busy='Starting a sync...'>"
             + _button("Sync now")
             + "</form>"
             "<p class='note'>A first sync backfills years of data and can run for tens of minutes. "
             "It continues in the background; this page does not need to stay open.</p>"
-            "<form method='post' action='/setup/unlink'>"
+            + _import_scope_form(view)
+            + _coverage_table(view)
+            + "<form method='post' action='/setup/unlink'>"
             + _button("Unlink this Garmin account")
             + "</form>"
             "<p class='note'>Unlinking deletes the saved token. Your downloaded health data is kept.</p>"
@@ -226,17 +399,66 @@ def _render(
     )
 
 
-@get("/setup", media_type=MediaType.HTML, sync_to_thread=False)
-def setup_page(state: State) -> str:
+async def _page_view(
+    state: State, *, scope_error: str | None = None, consume_flash: bool = True
+) -> PageView:
     authenticator = _authenticator(state)
-    # take_error(), not peek: rendering the failure consumes it, so refreshing the
-    # page does not keep reporting a sign-in that failed once.
-    return _render(
-        authenticator.status(),
-        authenticator.take_error(),
-        _describe_last_sync(_sync_engine(state)),
-        _serving_fault(state),
+    engine = _sync_engine(state)
+    status = authenticator.status()
+    coverage: list[StatCoverage] = []
+    if status.state is LinkState.LINKED:
+        # Only worth the query once there is an account to have downloaded
+        # anything; behind a TTL inside the engine either way.
+        coverage = list((await engine.coverage()).values())
+    return PageView(
+        status=status,
+        # take_error(), not peek: rendering the failure consumes it, so refreshing
+        # the page does not keep reporting a sign-in that failed once.
+        error=authenticator.take_error() if consume_flash else authenticator.peek_error(),
+        sync_summary=_describe_last_sync(engine),
+        preferences=load_preferences(state.settings),
+        coverage=coverage,
+        step=engine.step,
+        scope_error=scope_error,
+        serving_fault=_serving_fault(state),
     )
+
+
+@get("/setup", media_type=MediaType.HTML)
+async def setup_page(state: State) -> str:
+    return _render(await _page_view(state))
+
+
+@post("/setup/import", media_type=MediaType.HTML)
+async def submit_import_scope(
+    state: State,
+    data: Annotated[dict[str, Any], Body(media_type=RequestEncodingType.URL_ENCODED)],
+) -> Response[str]:
+    """Save how far back to import and which metrics to fetch.
+
+    On success this redirects (post/redirect/get, so a refresh does not resubmit).
+    On a validation failure it re-renders the page with the reason instead of
+    redirecting, which keeps the explanation attached to the form that caused it
+    without needing a flash that could outlive the mistake.
+    """
+    raw_stats = data.get("stats", [])
+    # A single ticked checkbox arrives as a bare string, several as a list.
+    stats = [raw_stats] if isinstance(raw_stats, str) else list(raw_stats)
+    try:
+        preferences = parse_preferences(
+            state.settings, start_date=str(data.get("start_date", "")), stats=stats
+        )
+    except InvalidPreferences as exc:
+        view = await _page_view(state, scope_error=str(exc), consume_flash=False)
+        return Response(content=_render(view), media_type=MediaType.HTML, status_code=400)
+
+    save_preferences(state.settings, preferences)
+    # Rewrite GarminConnectConfig.json now rather than at the next sync, so the
+    # saved scope is what the next download reads even if this process restarts.
+    ensure_config(state.settings, preferences=preferences)
+    # The coverage table is measured against the floor that just changed.
+    await _sync_engine(state).coverage(refresh=True)
+    return Response(content="", status_code=HTTP_303_SEE_OTHER, headers={"Location": "/setup"})
 
 
 @get("/setup/status", sync_to_thread=False)
@@ -313,17 +535,37 @@ async def trigger_rebuild(state: State) -> dict[str, object]:
     }
 
 
-@get("/sync/status", sync_to_thread=True)
-def sync_status(state: State) -> dict[str, object]:
+@post("/backfill", status_code=HTTP_202_ACCEPTED)
+async def trigger_backfill(state: State) -> dict[str, object]:
+    """Fetch the older history each enabled metric is missing. Returns immediately.
+
+    Needs a linked account, unlike a rebuild: this one really does talk to Garmin.
+    """
+    if _authenticator(state).status().state is not LinkState.LINKED:
+        raise HTTPException(
+            status_code=HTTP_409_CONFLICT,
+            detail="Cannot download history until the Garmin account is linked. Visit /setup.",
+        )
+    started = await _sync_engine(state).trigger(backfill=True)
+    return {
+        "started": started,
+        "detail": "Backfill started." if started else "A sync is already running.",
+    }
+
+
+@get("/sync/status")
+async def sync_status(state: State) -> dict[str, object]:
     """Sync state plus the serving layer's own health.
 
     The two fail independently: a corpus can be perfectly fresh and still be
     unservable because its schema needs rebuilding, and that is a fault only the
     owner can clear -- so it has to be visible somewhere the owner looks.
     """
-    status: dict[str, object] = _sync_engine(state).status()
+    engine = _sync_engine(state)
+    status: dict[str, object] = engine.status()
     service = state.get("health_service")
     status["serving"] = service.status() if service is not None else {"available": False}
+    status["coverage"] = [c.as_dict() for c in (await engine.coverage()).values()]
     return status
 
 
@@ -335,7 +577,9 @@ owner_router = Router(
         submit_credentials,
         submit_mfa,
         unlink,
+        submit_import_scope,
         trigger_sync,
+        trigger_backfill,
         trigger_rebuild,
         sync_status,
     ],

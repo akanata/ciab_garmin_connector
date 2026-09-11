@@ -49,7 +49,11 @@ from garmin_health.garmin_config import load_manager
 # TableStat is a plain value object on the port between sync.py and this adapter;
 # importing it here does not drag garmindb into sync.py, which is what keeps the
 # engine testable and GarminDB swappable.
+from garmin_health.preferences import STAT_LABELS
+from garmin_health.sync import ProgressSink
+from garmin_health.sync import StatCoverage
 from garmin_health.sync import TableStat
+from garmin_health.sync import _no_progress
 from garmin_health.sync import incremental_range
 
 logger = logging.getLogger(__name__)
@@ -61,6 +65,17 @@ logger = logging.getLogger(__name__)
 # make that visible.
 IMPORT_LATEST = True
 DEBUG = 0
+
+# Which table stands for each downloadable statistic: the database it lives in,
+# the table class, and the column ``latest_time`` filters on to skip placeholder
+# rows. Single source of truth for the download plan and the coverage report, so
+# the two cannot drift apart and report different histories for the same metric.
+STAT_TABLES: dict[str, tuple[str, Any, Any]] = {
+    "monitoring": ("monitoring", MonitoringHeartRate, MonitoringHeartRate.heart_rate),
+    "sleep": ("garmin", Sleep, Sleep.total_sleep),
+    "rhr": ("garmin", RestingHeartRate, RestingHeartRate.resting_heart_rate),
+    "hrv": ("garmin", Hrv, Hrv.day),
+}
 
 
 def _refuse_mfa() -> str:
@@ -161,6 +176,37 @@ class GarminDbIngest:
             )
         return stats
 
+    def _db_for(self, kind: str) -> Any:
+        return self._garmin_db if kind == "garmin" else self._monitoring_db
+
+    def stat_coverage(self) -> dict[str, StatCoverage]:
+        """How much history each selectable metric holds, against the owner's floor.
+
+        Reports **every** selectable statistic, including disabled ones: the owner
+        needs to see what a metric already holds in order to decide whether to
+        switch it back on.
+
+        ``earliest`` is a plain minimum over the time column with no not-zero
+        filter, unlike ``latest_time``. A placeholder row still represents a day
+        that was downloaded, and this answers "how far back does the corpus go".
+        """
+        enabled = {stat.name for stat in self._config.enabled_stats()}
+        coverage: dict[str, StatCoverage] = {}
+        for stat, (kind, table, column) in STAT_TABLES.items():
+            db = self._db_for(kind)
+            floor, _ = self._config.stat_start_date(stat)
+            earliest = table.get_col_min(db, table.time_col)
+            latest = table.latest_time(db, column)
+            coverage[stat] = StatCoverage(
+                stat=stat,
+                enabled=stat in enabled,
+                rows=table.row_count(db),
+                earliest=earliest.date().isoformat() if earliest is not None else None,
+                latest=latest.date().isoformat() if latest is not None else None,
+                floor=floor.isoformat(),
+            )
+        return coverage
+
     # -- download -------------------------------------------------------------
 
     def download_plan(self, *, today: dt.date | None = None) -> dict[str, tuple[dt.date, int]]:
@@ -197,13 +243,20 @@ class GarminDbIngest:
         download.garmin.mfa_prompt = _refuse_mfa
         return download
 
-    def download(self, stop: Event) -> None:
-        """Fetch JSON/FIT files for every enabled stat.
+    def _fetch(self, download: Any, stat: str, date: dt.date, days: int) -> None:
+        """One statistic's files for ``days`` days starting at ``date``."""
+        if stat == "monitoring":
+            download.get_daily_summaries(self._config.get_monitoring_dir, date, days, False)
+            download.get_hydration(self._config.get_monitoring_dir, date, days, False)
+            download.get_monitoring(self._config.get_monitoring_dir, date, days)
+        elif stat == "sleep":
+            download.get_sleep(self._config.get_sleep_dir(), date, days, False)
+        elif stat == "rhr":
+            download.get_rhr(self._config.get_rhr_dir(), date, days, False)
+        elif stat == "hrv":
+            download.get_hrv(self._config.get_rhr_dir(), date, days, False)
 
-        Each stat sleeps a second per day and retries five times with backoff, so
-        a first backfill runs for tens of minutes. ``stop`` is checked between
-        stats, which is the only interruption point GarminDB actually offers.
-        """
+    def _login(self) -> Any:
         download = self._make_download()
         if not download.login():
             # login() returns False rather than raising; unchecked, the sync would
@@ -212,26 +265,65 @@ class GarminDbIngest:
                 "Could not log in to Garmin Connect. The saved token may have expired -- "
                 "re-link the account at /setup."
             )
+        return download
 
-        plan = self.download_plan()
-        for stat, (date, days) in plan.items():
+    def _run_plan(
+        self, plan: dict[str, tuple[dt.date, int]], stop: Event, progress: ProgressSink, verb: str
+    ) -> None:
+        download = self._login()
+        total = len(plan)
+        for index, (stat, (date, days)) in enumerate(plan.items()):
             if stop.is_set():
                 logger.info("Stop requested; ending the download before %s.", stat)
                 return
             if days <= 0:
                 logger.info("Nothing to download for %s.", stat)
                 continue
+            # Reported before the call, not after: this is the only signal anyone
+            # gets while a stat sleeps a second per day for the next twenty minutes.
+            progress(
+                f"{verb} {STAT_LABELS.get(stat, stat)} ({days} days from {date})", index, total
+            )
             logger.info("Downloading %s from %s for %s days.", stat, date, days)
-            if stat == "monitoring":
-                download.get_daily_summaries(self._config.get_monitoring_dir, date, days, False)
-                download.get_hydration(self._config.get_monitoring_dir, date, days, False)
-                download.get_monitoring(self._config.get_monitoring_dir, date, days)
-            elif stat == "sleep":
-                download.get_sleep(self._config.get_sleep_dir(), date, days, False)
-            elif stat == "rhr":
-                download.get_rhr(self._config.get_rhr_dir(), date, days, False)
-            elif stat == "hrv":
-                download.get_hrv(self._config.get_rhr_dir(), date, days, False)
+            self._fetch(download, stat, date, days)
+        progress(f"{verb} finished", total, total)
+
+    def download(self, stop: Event, progress: ProgressSink = _no_progress) -> None:
+        """Fetch JSON/FIT files forward from each stat's newest row.
+
+        Each stat sleeps a second per day and retries five times with backoff, so
+        a first backfill runs for tens of minutes. ``stop`` is checked between
+        stats, which is the only interruption point GarminDB actually offers.
+        """
+        self._run_plan(self.download_plan(), stop, progress, "Downloading")
+
+    def backfill_plan(self) -> dict[str, tuple[dt.date, int]]:
+        """Per-stat ``(start, days)`` for history *older* than what we hold.
+
+        The complement of :meth:`download_plan`, which only ever moves forward
+        from the newest row -- so lowering the configured floor otherwise has no
+        effect at all on a metric that already holds data.
+
+        A metric with no rows is deliberately absent: ``incremental_range``
+        already starts an empty table at the floor, so backfilling it here would
+        just duplicate a normal sync at twice the cost.
+        """
+        plan: dict[str, tuple[dt.date, int]] = {}
+        for stat, coverage in self.stat_coverage().items():
+            if not coverage.enabled or not coverage.has_gap:
+                continue
+            floor = dt.date.fromisoformat(coverage.floor)
+            plan[stat] = (floor, coverage.missing_days)
+        return plan
+
+    def backfill(self, stop: Event, progress: ProgressSink = _no_progress) -> None:
+        """Fetch only the older range each enabled metric is missing."""
+        plan = self.backfill_plan()
+        if not plan:
+            logger.info("Nothing to backfill: every enabled metric reaches its start date.")
+            progress("Nothing to backfill", 0, 0)
+            return
+        self._run_plan(plan, stop, progress, "Backfilling")
 
     # -- import ---------------------------------------------------------------
 
@@ -252,7 +344,13 @@ class GarminDbIngest:
             logger.warning("Could not read measurement_system (%s); importing without it.", exc)
             return None
 
-    def import_(self, stop: Event, *, latest: bool = IMPORT_LATEST) -> None:
+    def import_(
+        self,
+        stop: Event,
+        progress: ProgressSink = _no_progress,
+        *,
+        latest: bool = IMPORT_LATEST,
+    ) -> None:
         """Import the downloaded files, profile first.
 
         ``latest=False`` reimports the whole retained corpus rather than the last
@@ -270,6 +368,7 @@ class GarminDbIngest:
             ("personal information", self._bindings.personal_information(dbp, fit_dir, DEBUG)),
             ("social profile", self._bindings.social_profile(dbp, fit_dir, DEBUG)),
         )
+        progress("Importing profile", 0, 4)
         for name, step in profile_steps:
             if stop.is_set():
                 logger.info("Stop requested; ending the import before %s.", name)
@@ -280,6 +379,7 @@ class GarminDbIngest:
 
         if stop.is_set():
             return
+        progress("Importing heart rate and daily activity", 1, 4)
         self._process(
             self._bindings.summary(dbp, monitoring_dir, latest, measurement_system, DEBUG)
         )
@@ -293,6 +393,7 @@ class GarminDbIngest:
 
         if stop.is_set():
             return
+        progress("Importing sleep", 2, 4)
         # Prefer Garmin Connect's JSON; fall back to FIT sleep files when there is none.
         sleep_json = self._bindings.sleep_json(dbp, self._config.get_sleep_dir(), latest, DEBUG)
         if sleep_json.file_count() > 0:
@@ -307,6 +408,7 @@ class GarminDbIngest:
 
         if stop.is_set():
             return
+        progress("Importing resting heart rate and HRV", 3, 4)
         rhr_dir = self._config.get_rhr_dir()
         self._process(self._bindings.rhr(dbp, rhr_dir, latest, DEBUG))
         # HRV tends to land in the same place as RHR.
@@ -314,7 +416,7 @@ class GarminDbIngest:
 
     # -- rebuild --------------------------------------------------------------
 
-    def rebuild(self, stop: Event) -> None:
+    def rebuild(self, stop: Event, progress: ProgressSink = _no_progress) -> None:
         """Delete both SQLite files and reimport the whole retained corpus.
 
         The owner's way out of a schema mismatch. There is no download: persisting
@@ -328,13 +430,15 @@ class GarminDbIngest:
         the deleted inode, so it is dropped too.
         """
         logger.warning("Rebuilding the GarminDB databases in %s.", self._db_params.db_path)
+        progress("Deleting the local databases", 0, 0)
         self._handles = None
         GarminDb.delete_db(self._db_params)
         MonitoringDb.delete_db(self._db_params)
-        self.import_(stop, latest=False)
+        self.import_(stop, progress, latest=False)
         if stop.is_set():
             logger.warning("Stop requested during the rebuild; skipping the analyze phase.")
             return
+        progress("Building summaries", 0, 0)
         self.analyze()
 
     # -- analyze --------------------------------------------------------------
