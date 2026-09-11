@@ -32,4 +32,11 @@ app_data = true
 # cloud-in-a-bottle URL here would mean no consumer ever routes to us.
 service = "github.com/imbue-openhost/health-data-service-spec"
 version = "0.1.0"
-endpoint = "/v1/"
+# The router PREPENDS this to the path the consumer asked for: "service requests
+# land rooted at `endpoint` in the provider app". The spec's client requests
+# "/v1/metrics", so this must be "/api/" to land on "/api/v1/metrics" -- which is
+# also what the working apple-health-connector declares.
+#
+# "/v1/" here would land it on "/v1/v1/metrics": a 404 that the consumer reads as
+# "this provider has nothing", producing a blank dashboard and no error anywhere.
+endpoint = "/api/"

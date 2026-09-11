@@ -1,4 +1,4 @@
-"""``/v1/*`` -- the spec surface.
+"""``/api/v1/*`` -- the spec surface.
 
 Deliberately **not** owner-gated: these arrive through the router's internal
 service proxy, which strips any client-supplied ``X-OpenHost-*`` and stamps
@@ -50,6 +50,18 @@ from garmin_health.service import UnknownMetric
 from garmin_health.timezones import TimeZoneUnresolved
 
 logger = logging.getLogger(__name__)
+
+
+# The router **prepends** a provider's declared `endpoint` to the path the
+# consumer asked for: "Service requests land rooted at `endpoint` in the provider
+# app, ie app-name.your-domain.com/<endpoint>/<route>". The spec's client asks for
+# "/v1/metrics", so endpoint="/api/" lands it on the "/api/v1" mounted here.
+#
+# Declaring endpoint="/v1/" instead would land it on "/v1/v1/metrics" -- a 404,
+# which the consumer's _fan_out reads as "this provider has nothing". Nothing
+# errors anywhere; the consumer just renders an empty page.
+# tests/test_service_routes.py keeps the manifest and this mount in agreement.
+SERVICE_ROOT = "/api/v1"
 
 
 class BadRequest(Exception):
@@ -152,7 +164,7 @@ def _problem(status: int) -> Any:
 
 
 v1_router = Router(
-    path="/v1",
+    path=SERVICE_ROOT,
     route_handlers=[list_metrics, time_series, sleep_sessions, list_workouts, get_workout],
     exception_handlers={
         UnknownMetric: _problem(HTTP_404_NOT_FOUND),

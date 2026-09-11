@@ -27,9 +27,10 @@ by `uv.lock`.
 
 **Landed — plan.md Part 4, the serving layer:** `serialization.py`,
 `registry.py`, `service.py`, `routes/service.py`, and
-`garmin/{connection,sampling,vocabulary,heart_rate,daily,sleep}.py`. `/v1/metrics`,
-`/v1/time-series` and `/v1/sleep-sessions` serve real data; `/v1/workouts` is an
-empty `{"data": []}` and `/v1/workouts/{id}` a 404, both deliberately.
+`garmin/{connection,sampling,vocabulary,heart_rate,daily,sleep}.py`. `/api/v1/metrics`,
+`/api/v1/time-series` and `/api/v1/sleep-sessions` serve real data;
+`/api/v1/workouts` is an empty `{"data": []}` and `/api/v1/workouts/{id}` a 404,
+both deliberately.
 `resolve_policy()` is now called once at boot by `garmin/connection.py`, and
 again on every `GarminConnection.reset()`.
 
@@ -143,7 +144,7 @@ src/garmin_health/
   auth.py           Garmin login + MFA state machine.
   sync.py           download -> import -> analyze; the background loop.
   garmin/           connection, sampling, vocabulary, heart_rate, sleep, daily.
-  routes/           service.py (/v1/*), owner.py (/setup, /sync, /health).
+  routes/           service.py (/api/v1/*), owner.py (/setup, /sync, /health).
 tests/
   fixtures.py       build_fixture() - a real GarminDB SQLite in a tmpdir.
 ```
@@ -216,7 +217,25 @@ imported only by `garmin/*`.
 - The manifest must declare the service as
   `github.com/imbue-openhost/health-data-service-spec` — the pre-rename string
   the spec's client still hardcodes. Declaring the `cloud-in-a-bottle` URL
-  means no consumer will ever route to us. Verify against a live router.
+  means no consumer will ever route to us. Confirmed against
+  `health-dashboard`'s `[[services.v2.consumes]]`, which asks for exactly this.
+- **`endpoint` is a prefix the router PREPENDS, not a description of where the
+  routes already are.** The docs: "Service requests land rooted at `endpoint` in
+  the provider app, ie `app-name.your-domain.com/<endpoint>/<route>`". The spec's
+  client requests `/v1/metrics`, so `endpoint = "/api/"` lands on
+  `/api/v1/metrics` — which is what we serve, and what the working
+  `apple-health-connector` declares. `endpoint = "/v1/"` lands on
+  `/v1/v1/metrics`: a 404 that `_fan_out` reads as "this provider has nothing",
+  giving a blank consumer and **no error in any log**. `TestManifestRoutingContract`
+  parses `openhost.toml` and asserts every path the client requests is served
+  where the router will look; keep it passing.
+- The spec surface is mounted **only** at `/api/v1/*` — the path the router
+  actually asks for. `SERVICE_ROOT` in `routes/service.py` and `endpoint` in
+  `openhost.toml` have to move together, and `TestManifestRoutingContract` is
+  what enforces that. To reach it without the router (for a manual check), call
+  `/api/v1/metrics` directly; there is deliberately no second mount.
+- `[resources]` takes `cpu_cores`, not `cpu_millicores` — the Apple connector
+  uses the latter and silently gets the 0.1-core default. Do not copy it.
 
 **GarminDB.**
 
