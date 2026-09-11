@@ -41,14 +41,11 @@ from health_data_service import SleepStage
 from health_data_service import SleepStages
 from sqlalchemy.orm import Session
 
-from garmin_health.config import MAX_ROWS_SCANNED
 from garmin_health.garmin.connection import GarminConnection
 from garmin_health.garmin.heart_rate import heart_rate_stats
 from garmin_health.garmin.heart_rate import session_heart_rate
 from garmin_health.garmin.heart_rate import session_hrv
 from garmin_health.garmin.heart_rate import window_hrv_average
-from garmin_health.garmin.sampling import WindowTooLarge
-from garmin_health.garmin.sampling import period_count
 from garmin_health.garmin.sampling import period_rows
 from garmin_health.garmin.vocabulary import stage_for_event
 from garmin_health.timezones import TimeZonePolicy
@@ -60,6 +57,13 @@ SOURCE = "garmin"
 # Garmin's calendarDate-to-bedtime semantics are not worth guessing at, so events
 # are searched over a wide window around `day` and then clustered.
 EVENT_SEARCH_WINDOW = dt.timedelta(hours=24)
+# ...but a cluster only belongs to this night if it actually overlaps a plausible
+# night for it: 15:00 the previous afternoon to 15:00 on the day itself. Without
+# this, the +/-24h search catches the *tail* of the previous night (which ends
+# around 07:00 the previous morning) and, with no other candidate, a night whose
+# own events are missing silently adopts its neighbour's window and stages.
+# Generous enough for an early bedtime; far from the neighbour's tail either way.
+NIGHT_WINDOW = (dt.timedelta(hours=-9), dt.timedelta(hours=15))
 # Two consecutive nights are ~16h apart; stages within a night are minutes apart.
 CLUSTER_GAP = dt.timedelta(hours=3)
 # Where a night sits relative to its own calendar date, used only to pick a
@@ -92,6 +96,43 @@ def _duration(value: float | None) -> Duration | None:
     return None if value is None else Duration(value=float(value), source=SOURCE)
 
 
+def _candidate_rows(
+    session: Session, lo_day: dt.datetime | None, hi_day: dt.datetime | None
+) -> Any:
+    """Sleep rows newest first, streamed rather than materialised.
+
+    Descending so that stopping at ``limit`` stops at the *old* end -- sessions
+    are served newest first, so truncating the other way would return the wrong
+    nights entirely.
+    """
+    query = session.query(Sleep).order_by(Sleep.time_col.desc())
+    if lo_day is not None:
+        query = query.filter(Sleep.after(lo_day))
+    if hi_day is not None:
+        query = query.filter(Sleep.before(hi_day))
+    return query
+
+
+def _clusters_near(session: Session, day: dt.datetime) -> list[list[Any]]:
+    """Event clusters within a day of ``day``, on the home clock.
+
+    Queried per night rather than once for the whole request: it costs one small
+    indexed query per session built, and in exchange the candidate set can never
+    contain a cluster from the far side of the corpus.
+    """
+    return _cluster_events(
+        period_rows(
+            session,
+            SleepEvents,
+            SleepEvents.timestamp,
+            SleepEvents.event,
+            SleepEvents.duration,
+            start=day - EVENT_SEARCH_WINDOW,
+            end=day + EVENT_SEARCH_WINDOW,
+        )
+    )
+
+
 def _cluster_events(rows: Sequence[Any]) -> list[list[Any]]:
     """Split timestamp-ordered event rows into one cluster per night."""
     clusters: list[list[Any]] = []
@@ -112,18 +153,24 @@ def _select_cluster(
     start_local: dt.datetime | None,
     day: dt.datetime,
 ) -> Sequence[Any] | None:
-    """Pick the cluster belonging to this night.
+    """Pick the cluster belonging to this night, or None if none plausibly does.
 
-    ``sleep.start`` is the better anchor when present -- moved onto the home clock
-    first, so both sides of the comparison are the same clock. Failing that, the
+    Candidacy first, nearest second. A cluster has to overlap a plausible night
+    for ``day`` at all -- returning the nearest of a set that contains no real
+    candidate is how a night with missing events ends up wearing its neighbour's.
+
+    Among the candidates, ``sleep.start`` is the better anchor when present, moved
+    onto the home clock first so both sides are the same clock. Failing that, the
     cluster whose midpoint sits closest to the small hours of ``day``.
     """
-    if not clusters:
+    earliest, latest = day + NIGHT_WINDOW[0], day + NIGHT_WINDOW[1]
+    candidates = [c for c in clusters if c[0][0] < latest and c[-1][0] >= earliest]
+    if not candidates:
         return None
     if start_local is not None:
-        return min(clusters, key=lambda c: abs(c[0][0] - start_local))
+        return min(candidates, key=lambda c: abs(c[0][0] - start_local))
     target = day + TYPICAL_SLEEP_MIDPOINT
-    return min(clusters, key=lambda c: abs(c[0][0] + (c[-1][0] - c[0][0]) / 2 - target))
+    return min(candidates, key=lambda c: abs(c[0][0] + (c[-1][0] - c[0][0]) / 2 - target))
 
 
 def _intervals(cluster: Sequence[Any], tz: TimeZonePolicy, *, fill_gaps: bool) -> list[_Interval]:
@@ -477,40 +524,26 @@ def build_sleep_sessions(
     lo_day = lo - DAY_MARGIN if lo is not None else None
     hi_day = hi + DAY_MARGIN if hi is not None else None
 
-    def query(g: Session, m: Session) -> list[SleepSession]:
-        rows = Sleep.s_get_for_period(g, lo_day, hi_day)
-        if not rows:
-            return []
-
-        event_lo = lo_day - EVENT_SEARCH_WINDOW if lo_day is not None else None
-        event_hi = hi_day + EVENT_SEARCH_WINDOW if hi_day is not None else None
-        events_scanned = period_count(g, SleepEvents, start=event_lo, end=event_hi)
-        if events_scanned > MAX_ROWS_SCANNED:
-            raise WindowTooLarge(events_scanned, MAX_ROWS_SCANNED)
-        clusters = _cluster_events(
-            period_rows(
-                g,
-                SleepEvents,
-                SleepEvents.timestamp,
-                SleepEvents.event,
-                SleepEvents.duration,
-                start=event_lo,
-                end=event_hi,
-            )
+    def in_window(session: SleepSession) -> bool:
+        return (start_utc is None or session.start >= start_utc) and (
+            end_utc is None or session.start < end_utc
         )
 
-        built = []
-        for row in rows:
-            session = _build_one(row, clusters, conn, g, m)
-            if session is not None:
+    def query(g: Session, m: Session) -> list[SleepSession]:
+        built: list[SleepSession] = []
+        # Newest first, and built lazily, because `limit` has to bound the *work*
+        # and not just the answer. Each session costs several monitoring queries,
+        # and get_sleep_sessions_merged sends a limit with **no window** -- so
+        # "build every night, then keep 60" is thousands of queries on a real
+        # corpus, and the consumer's 30-second timeout expires long before.
+        for row in _candidate_rows(g, lo_day, hi_day):
+            if limit is not None and len(built) >= limit:
+                break
+            session = _build_one(row, _clusters_near(g, row.day), conn, g, m)
+            if session is not None and in_window(session):
                 built.append(session)
         return built
 
     sessions = conn.read(query)
-    sessions = [
-        s
-        for s in sessions
-        if (start_utc is None or s.start >= start_utc) and (end_utc is None or s.start < end_utc)
-    ]
     sessions.sort(key=lambda s: s.start, reverse=True)
-    return sessions if limit is None else sessions[:limit]
+    return sessions

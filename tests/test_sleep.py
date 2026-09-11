@@ -9,11 +9,13 @@ from typing import Any
 
 import attrs
 import pytest
+from garmindb.garmindb import SleepEvents
 from health_data_service import IntervalSample
 from health_data_service import SleepSession
 from health_data_service import SleepStage
 
 from garmin_health.config import Settings
+from garmin_health.garmin import sleep as sleep_module
 from garmin_health.garmin.connection import GarminConnection
 from garmin_health.garmin.sleep import build_sleep_sessions
 from garmin_health.garmin.vocabulary import reset_unknown_event_log
@@ -616,3 +618,86 @@ def test_a_session_carries_only_fields_the_spec_declares(
         "efficiency",
         "sleep_score",
     }
+
+
+class TestBoundedWork:
+    """A consumer asking for 60 sessions must not cost a session per night held.
+
+    `get_sleep_sessions_merged` sends `limit` and **no window**, so an unbounded
+    request over a multi-year corpus is the normal case, not an edge case. Each
+    session costs several monitoring queries (heart-rate slice, HRV slice, the
+    stats, the respiration average), so building every night and then keeping 60
+    is thousands of queries the consumer's 30s httpx timeout will not wait for.
+    """
+
+    def test_only_the_requested_number_of_sessions_is_built(
+        self, corpus_settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        build_fixture(corpus_settings.health_data_dir, nights=10)
+        built: list[str] = []
+        real = sleep_module._build_one
+
+        def counting(row: Any, *args: Any, **kwargs: Any) -> Any:
+            built.append(str(row.day))
+            return real(row, *args, **kwargs)
+
+        monkeypatch.setattr(sleep_module, "_build_one", counting)
+        with GarminConnection(corpus_settings) as conn:
+            sessions = build_sleep_sessions(conn, None, None, 2)
+
+        assert len(sessions) == 2
+        assert len(built) == 2, f"built {len(built)} sessions to return 2"
+
+    def test_the_newest_nights_are_the_ones_built(self, corpus_settings: Settings) -> None:
+        """Sessions are served newest-first, so stopping early has to stop at the
+        *old* end or the limit would return the wrong nights."""
+        fixture = build_fixture(corpus_settings.health_data_dir, nights=10)
+        with GarminConnection(corpus_settings) as conn:
+            sessions = build_sleep_sessions(conn, None, None, 3)
+        assert [s.id for s in sessions] == [n.session_id for n in fixture.nights[-3:][::-1]]
+
+    def test_a_full_request_still_returns_everything(self, corpus_settings: Settings) -> None:
+        build_fixture(corpus_settings.health_data_dir, nights=5)
+        with GarminConnection(corpus_settings) as conn:
+            assert len(build_sleep_sessions(conn, None, None, 50)) == 5
+
+
+class TestEventsBelongToTheirOwnNight:
+    """A night's stages must come from that night's events, never a neighbour's."""
+
+    @staticmethod
+    def _drop_events_for(fixture: Fixture, night: Any) -> None:
+        with fixture.garmin_db.managed_session() as session:
+            session.query(SleepEvents).filter(
+                SleepEvents.timestamp >= night.first_event_local - dt.timedelta(hours=1)
+            ).delete(synchronize_session=False)
+
+    def test_a_night_without_events_does_not_borrow_the_previous_nights(
+        self, corpus_settings: Settings
+    ) -> None:
+        """With no window the candidate clusters span the whole corpus, so a
+        nearest-cluster match with no distance cap silently hands this night the
+        previous night's window and stage timeline."""
+        fixture = build_fixture(corpus_settings.health_data_dir, nights=3)
+        newest = fixture.newest
+        self._drop_events_for(fixture, newest)
+
+        with GarminConnection(corpus_settings) as conn:
+            sessions = build_sleep_sessions(conn, None, None, None)
+
+        served = next(s for s in sessions if s.id == newest.session_id)
+        assert served.start == newest.start_utc
+        assert served.end == newest.end_utc
+        assert served.stages is None
+
+    def test_the_other_nights_keep_their_own_stages(self, corpus_settings: Settings) -> None:
+        fixture = build_fixture(corpus_settings.health_data_dir, nights=3)
+        self._drop_events_for(fixture, fixture.newest)
+
+        with GarminConnection(corpus_settings) as conn:
+            sessions = build_sleep_sessions(conn, None, None, None)
+
+        for session, night in zip(sessions[1:], fixture.nights[:-1][::-1], strict=True):
+            assert session.start == night.start_utc
+            assert session.stages is not None
+            assert len(session.stages.samples) == len(STAGES)

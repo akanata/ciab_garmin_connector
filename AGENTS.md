@@ -309,6 +309,26 @@ imported only by `garmin/*`.
   fire-and-forget by design, and `run_once` clears the step in a `finally` — a
   progress line left standing reads as a sync that never finished.
 
+**Serving a consumer, not a curl.**
+
+- `get_sleep_sessions_merged` sends a `limit` and **no window**. An unbounded
+  request over the whole corpus is therefore the *normal* case. `limit` has to
+  bound the **work**, not just the answer: each session costs several monitoring
+  queries, so "build every night, then keep 60" is thousands of queries, and the
+  spec client's httpx timeout is 30s. `build_sleep_sessions` streams rows newest
+  first and stops at `limit`; `TestBoundedWork` pins that.
+- A cluster is only this night's if it overlaps `NIGHT_WINDOW` around `day`.
+  Picking the *nearest* cluster with no candidacy check meant a night whose own
+  events were missing silently wore its neighbour's window and stage timeline —
+  the +/-24h search catches the previous night's tail.
+- `health-dashboard` hard-wires several Oura-only metrics. Its "Today" panel
+  renders only when `readiness_score` has a sample for today, and we deliberately
+  do not serve that (GarminDB has no Training Readiness — see `registry.py`). Its
+  heart-rate section hides itself entirely when `heart_rate` returns no samples in
+  the **last 24 hours**, and its sleep panels drop any session whose
+  `total_duration` is under 30 minutes. A blank dashboard is not by itself
+  evidence of a fault on this side.
+
 **Sync.**
 
 - `sync.py` imports **no** `garmindb`: it drives an `Ingest` port that
