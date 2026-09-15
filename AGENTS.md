@@ -82,7 +82,8 @@ push/webhook ingest. There is still no full-reimport endpoint *other* than
 **Environment knobs:** `GARMIN_HOME_TZ`, `GARMIN_IMPORT_TZ`,
 `GARMIN_BACKFILL_START_DATE` (default `2019-12-31`; a full backfill is roughly
 one second per day *per stat*, so the default is hours on first run),
-`SYNC_INTERVAL_SECONDS` (default 1h; it only *seeds* the interval the owner sets on `/setup`), `GARMIN_DOMAIN`, `BOTTLE_APP_DATA_DIR`,
+`SYNC_INTERVAL_SECONDS` (default 1h; it only *seeds* the interval the owner sets on `/setup`), `GARMIN_DOMAIN`, `BOTTLE_APP_DATA_DIR` (or the legacy
+`OPENHOST_APP_DATA_DIR`; set by the router, never by the image),
 `GARMIN_FILL_STAGE_GAPS` and `GARMIN_DERIVE_RESTLESS_PERIODS` (both default
 false; both make the service emit data Garmin did not record, so leave them off
 unless a specific consumer needs them). Serving limits are constants in
@@ -241,6 +242,16 @@ imported only by `garmin/*`.
   `/api/v1/metrics` directly; there is deliberately no second mount.
 - `[resources]` takes `cpu_cores`, not `cpu_millicores` — the Apple connector
   uses the latter and silently gets the 0.1-core default. Do not copy it.
+- **The Dockerfile must not set `BOTTLE_*` or `OPENHOST_*` variables.** The router
+  `podman rm -f`s the container on every update, reload and restart, so only the
+  bind mount at `/data/app_data/<app>` survives. Routers before 2026-08-27 export
+  only `OPENHOST_APP_DATA_DIR`; a `BOTTLE_APP_DATA_DIR` baked into the image then
+  wins `config.py`'s name precedence, and the token, the preferences and the whole
+  corpus land on the container's own disk -- working perfectly until the next
+  update wipes them. That is exactly what `ENV BOTTLE_APP_DATA_DIR=/app/data` did.
+  A bare `docker run` needs no such line: `DEFAULT_APP_DATA_DIR` is `data`,
+  relative to `WORKDIR /app`. `test_the_image_never_shadows_the_routers_volume`
+  pins it.
 
 **GarminDB.**
 

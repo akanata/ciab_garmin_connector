@@ -187,8 +187,9 @@ def settings_from_env(env: Mapping[str, str] | None = None) -> Settings:
     """Build Settings from ``env`` (defaults to ``os.environ``)."""
     env = os.environ if env is None else env
 
-    # Cloud in a Bottle renamed OPENHOST_* to BOTTLE_*, but deployed apps still
-    # export only the old name, so both are accepted with the new one winning.
+    # Cloud in a Bottle renamed OPENHOST_* to BOTTLE_*. Routers from 2026-08-27 on
+    # export both; older ones export only the old name. Both are accepted with the new
+    # one winning -- which is exactly why the image must never bake in a BOTTLE_ value.
     app_data_dir = (
         _path_from(env, "BOTTLE_APP_DATA_DIR", "OPENHOST_APP_DATA_DIR") or DEFAULT_APP_DATA_DIR
     )

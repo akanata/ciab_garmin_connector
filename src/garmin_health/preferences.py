@@ -186,7 +186,12 @@ def load_preferences(settings: Settings) -> ImportPreferences:
     if stored_interval is None:
         # A file saved before this setting existed.
         interval = defaults.sync_interval_seconds
-    elif not isinstance(stored_interval, int) or stored_interval <= 0:
+    elif (
+        # bool is an int subclass: a stored `true` would otherwise pass as 1 second.
+        isinstance(stored_interval, bool)
+        or not isinstance(stored_interval, int)
+        or stored_interval <= 0
+    ):
         logger.warning(
             "Import preferences hold an unusable sync_interval_seconds %r; using %s.",
             stored_interval,

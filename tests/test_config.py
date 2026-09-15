@@ -19,7 +19,7 @@ def test_prefers_bottle_app_data_dir_over_openhost() -> None:
 
 
 def test_falls_back_to_openhost_app_data_dir() -> None:
-    """Older deployments (and fitpub_oh) still export only OPENHOST_APP_DATA_DIR."""
+    """Routers from before 2026-08-27 export only OPENHOST_APP_DATA_DIR."""
     s = settings_from_env({"OPENHOST_APP_DATA_DIR": "/openhost"})
     assert s.app_data_dir == Path("/openhost")
 
@@ -27,6 +27,53 @@ def test_falls_back_to_openhost_app_data_dir() -> None:
 def test_defaults_when_no_app_data_dir_is_exported() -> None:
     s = settings_from_env({})
     assert s.app_data_dir == Path("data")
+
+
+DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
+ROUTER_VOLUME = "/data/app_data/garmin-connector"
+
+
+def image_env() -> dict[str, str]:
+    """The ENV the image bakes in. ``podman run -e`` then overrides it key by key."""
+    env: dict[str, str] = {}
+    for line in DOCKERFILE.read_text().replace("\\\n", " ").splitlines():
+        parts = line.split()
+        if not parts or parts[0].upper() != "ENV":
+            continue
+        if len(parts) > 1 and "=" not in parts[1]:
+            env[parts[1]] = " ".join(parts[2:])  # the legacy `ENV KEY value` form
+            continue
+        for pair in parts[1:]:
+            key, _, value = pair.partition("=")
+            env[key] = value
+    return env
+
+
+def test_the_dockerfile_env_parser_sees_the_images_env() -> None:
+    """Guards the test below from passing vacuously on a parser that finds nothing."""
+    assert image_env().get("TZ") == "UTC"
+
+
+@pytest.mark.parametrize(
+    "router_env",
+    [
+        pytest.param({"OPENHOST_APP_DATA_DIR": ROUTER_VOLUME}, id="router-before-2026-08-27"),
+        pytest.param(
+            {"OPENHOST_APP_DATA_DIR": ROUTER_VOLUME, "BOTTLE_APP_DATA_DIR": ROUTER_VOLUME},
+            id="router-exporting-both-names",
+        ),
+    ],
+)
+def test_the_image_never_shadows_the_routers_volume(router_env: dict[str, str]) -> None:
+    """Anything written outside the router's mount is lost on every update.
+
+    The router ``podman rm -f``s the container on each update, reload and restart.
+    A router from before 2026-08-27 exports only OPENHOST_APP_DATA_DIR, so a
+    BOTTLE_APP_DATA_DIR baked into the image wins the name precedence and puts the
+    token, the preferences and the whole corpus on the container's own disk.
+    """
+    s = settings_from_env({**image_env(), **router_env})
+    assert s.app_data_dir == Path(ROUTER_VOLUME)
 
 
 def test_derived_paths_all_live_under_app_data(settings: Settings) -> None:

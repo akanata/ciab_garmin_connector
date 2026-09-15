@@ -25,9 +25,12 @@ RUN uv sync --frozen --no-dev
 # the importing container's TZ, so a wrong zone here silently skews stored data.
 ENV TZ=UTC
 
-# Overridden by the router, which mounts the real app-data volume. The fallback keeps
-# a bare `docker run` writing somewhere sane instead of the source tree.
-ENV BOTTLE_APP_DATA_DIR=/app/data
+# No BOTTLE_APP_DATA_DIR (or any BOTTLE_*/OPENHOST_* variable) here. The router
+# exports the app-data path itself and removes this container on every update, so
+# only its bind mount survives. Routers before 2026-08-27 export only
+# OPENHOST_APP_DATA_DIR, and a BOTTLE_ value baked in here would outrank it and put
+# every synced file on the container's own disk. A bare `docker run` with neither
+# variable still writes to ./data, i.e. /app/data.
 
 EXPOSE 8080
 
