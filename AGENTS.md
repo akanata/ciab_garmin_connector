@@ -44,9 +44,9 @@ is the owner's only way out of a schema mismatch in a container, and it never
 re-downloads. `/setup` shows the fault and the button only while there is one;
 `GET /sync/status` grew a `serving` block.
 
-**Owner-controlled import scope.** `preferences.py` persists the two knobs that
+**Owner-controlled import scope.** `preferences.py` persists the three knobs that
 decide how long a sync runs — the earliest date to import from, and which of the
-four downloadable statistics to fetch — to `import_preferences.json` under app
+four downloadable statistics to fetch, and how often the background sync runs — to `import_preferences.json` under app
 data. `GARMIN_BACKFILL_START_DATE` only *seeds* the default now; once the owner
 saves, the file wins. `/setup` renders the form, a per-metric coverage table
 (rows held, the window covered, and the gap against the chosen floor) and a live
@@ -69,6 +69,11 @@ says something the instant a sync starts rather than staying blank until the
 adapter reaches a reportable step. `/sync/status` exposes `progress` and
 `coverage`; `/setup` polls it and reloads once the run ends.
 
+**Schedule.** The background sync runs hourly by default and the owner can change
+it on `/setup`. Its start is persisted, so a restart syncs as soon as one is due
+rather than waiting out a whole interval — see the Sync guardrails for how that
+keeps the crash-loop protection the old sleep-first loop provided.
+
 **Not built yet:** workouts, body battery (`daily_summary.bb_*`, available but
 with no spec type — it would go under vendor-extension metric ids), and any
 push/webhook ingest. There is still no full-reimport endpoint *other* than
@@ -77,7 +82,7 @@ push/webhook ingest. There is still no full-reimport endpoint *other* than
 **Environment knobs:** `GARMIN_HOME_TZ`, `GARMIN_IMPORT_TZ`,
 `GARMIN_BACKFILL_START_DATE` (default `2019-12-31`; a full backfill is roughly
 one second per day *per stat*, so the default is hours on first run),
-`SYNC_INTERVAL_SECONDS` (default 6h), `GARMIN_DOMAIN`, `BOTTLE_APP_DATA_DIR`,
+`SYNC_INTERVAL_SECONDS` (default 1h; it only *seeds* the interval the owner sets on `/setup`), `GARMIN_DOMAIN`, `BOTTLE_APP_DATA_DIR`,
 `GARMIN_FILL_STAGE_GAPS` and `GARMIN_DERIVE_RESTLESS_PERIODS` (both default
 false; both make the service emit data Garmin did not record, so leave them off
 unless a specific consumer needs them). Serving limits are constants in
@@ -270,6 +275,27 @@ imported only by `garmin/*`.
 - `download_days_overlap` is a hardcoded class attribute on `Download` (`3`),
   **not** read from config — `gc_config.download_days_overlap()` returns `None`
   with our config and is simply unused. Do not "fix" it.
+- **GarminDB's own incremental rule never downloads today.** `garmindb_cli.py`
+  computes `start = newest − 1 day`, `days = (today − start).days`, and every
+  downloader loops `range(0, days)` — so the last day fetched is `start + days −
+  1`, i.e. *yesterday*. `GarminConnectConfigManager.stat_start_date` has the same
+  exclusive span for a first backfill. Last night's sleep carries **today's**
+  calendarDate and this morning's heart rate is in today's wellness file, so
+  neither arrived, and manual syncs could not help because each computed the same
+  range. `incremental_range` counts through today inclusive and takes an explicit
+  `floor`; `test_the_last_day_fetched_is_always_today` pins it. Do not "restore"
+  GarminDB's arithmetic. (Backfill ranges `[floor, earliest)` are correctly
+  exclusive — `earliest` is already held.)
+- The plan's "today" is the **account's** calendar date (`_home_today`), never
+  `date.today()`: the Dockerfile bootstraps `TZ=UTC`, which is a day ahead for a
+  western evening and a day behind for an eastern morning. Before the first
+  profile import stores a zone it falls back to the UTC date with a warning —
+  acceptable only because this is a download range, not a timestamp conversion.
+- `Download.get_monitoring` makes a `tempfile.mkdtemp()` per day, leaves that
+  day's wellness zip in it, **never removes it**, and keeps only the last on
+  `download.temp_dir`. Every sync re-fetches recent days, so `/tmp` grows without
+  bound, faster the more often syncs run. `_fetch` therefore asks for monitoring
+  one day per call and removes `download.temp_dir` after each.
 - **plan.md §4b's `selectable=(table.time_col, column)` does not work.**
   `DbObject._s_query` hands its `selectable` to `session.query()` as a *single*
   entity, and SQLAlchemy 2.0 raises `ArgumentError` on a tuple there.
@@ -346,8 +372,25 @@ imported only by `garmin/*`.
 - `POST /sync` is fire-and-forget and returns `202` immediately — a first
   backfill runs for tens of minutes. Tests must poll `/sync/status`, not assume
   the next request sees a result.
-- The loop **sleeps before its first sync**, so a crash-looping container cannot
-  replay a Garmin sign-in on every restart.
+- The schedule is **persisted, not slept**. Each forward sync writes its start to
+  `sync_state.json` *before* any Garmin work; the loop waits until
+  `last start + interval`, with a `STARTUP_GRACE_SECONDS` floor after a process
+  start and `MIN_GAP_SECONDS` between runs. A crash-looping container therefore
+  sees a recent start and waits out the interval — the protection the old
+  sleep-first loop gave — while a healthy restart after a long gap syncs within a
+  minute instead of waiting a whole interval. An unreadable state file counts as
+  never synced rather than disabling scheduling.
+- The interval is **re-read on every scheduling decision** from the owner's saved
+  preferences, and `SyncEngine.reschedule()` wakes the loop, so a change on
+  `/setup` applies at once rather than after the long wait already under way.
+  `POST /setup/import` calls it.
+- A **manual Sync now moves the schedule**; a **backfill does not**. A backfill
+  fetches old history and says nothing about how fresh the corpus is.
+- The form offers a **fixed set of intervals** (`SYNC_INTERVAL_CHOICES`, 15 min to
+  24 h), so neither a typo nor a crafted POST can make the sync hit Garmin every
+  minute. The operator's own `SYNC_INTERVAL_SECONDS` is always accepted even when
+  it is not in the list, or re-saving the page would be refused. Fifteen minutes is
+  already about as often as a watch syncs to Garmin Connect.
 
 **Auth.**
 

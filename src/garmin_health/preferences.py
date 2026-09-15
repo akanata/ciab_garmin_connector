@@ -25,6 +25,7 @@ from pathlib import Path
 import attrs
 import dateutil.parser
 
+from garmin_health.config import DEFAULT_SYNC_INTERVAL_SECONDS
 from garmin_health.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,36 @@ logger = logging.getLogger(__name__)
 # branches for these four. Offering the rest would be a checkbox that does
 # nothing, and Statistics.from_string would raise on anything not in its enum.
 DOWNLOADABLE_STATS: tuple[str, ...] = ("monitoring", "sleep", "rhr", "hrv")
+
+# What the owner can choose on /setup. A fixed set rather than a free number, so
+# neither a typo nor a hand-crafted POST can make the sync hit Garmin every
+# minute; fifteen minutes is already about as often as a watch syncs to Garmin
+# Connect, so shorter would fetch nothing new.
+SYNC_INTERVAL_CHOICES: tuple[int, ...] = (
+    15 * 60,
+    30 * 60,
+    60 * 60,
+    3 * 60 * 60,
+    6 * 60 * 60,
+    12 * 60 * 60,
+    24 * 60 * 60,
+)
+
+
+def _plural(count: int, unit: str) -> str:
+    return f"{count} {unit}" if count == 1 else f"{count} {unit}s"
+
+
+def sync_interval_label(seconds: int) -> str:
+    """ "Every hour", "Every 30 minutes" -- how the page names an interval."""
+    if seconds == 60 * 60:
+        return "Every hour"
+    if seconds % (60 * 60) == 0:
+        return f"Every {_plural(seconds // (60 * 60), 'hour')}"
+    if seconds % 60 == 0:
+        return f"Every {_plural(seconds // 60, 'minute')}"
+    return f"Every {_plural(seconds, 'second')}"
+
 
 # What each stat is called in the owner's language, and what it actually brings
 # in -- "rhr" and "monitoring" mean nothing to someone reading their own page.
@@ -61,6 +92,11 @@ class ImportPreferences:
 
     start_date: dt.date
     enabled_stats: frozenset[str]
+    # How often the background sync runs. Kept on the same saved document because
+    # it is the third knob deciding how much importing costs, and
+    # SYNC_INTERVAL_SECONDS seeds it the way GARMIN_BACKFILL_START_DATE seeds the
+    # start date.
+    sync_interval_seconds: int = DEFAULT_SYNC_INTERVAL_SECONDS
 
     @property
     def start_date_text(self) -> str:
@@ -80,6 +116,7 @@ class ImportPreferences:
             "start_date": self.start_date_text,
             # Sorted so the file does not churn between saves that changed nothing.
             "enabled_stats": sorted(self.enabled_stats),
+            "sync_interval_seconds": self.sync_interval_seconds,
         }
 
     @classmethod
@@ -87,6 +124,7 @@ class ImportPreferences:
         return cls(
             start_date=_parse_date(settings.backfill_start_date) or dt.date(2019, 12, 31),
             enabled_stats=frozenset(DOWNLOADABLE_STATS),
+            sync_interval_seconds=settings.sync_interval_seconds,
         )
 
 
@@ -144,7 +182,23 @@ def load_preferences(settings: Settings) -> ImportPreferences:
             if name not in DOWNLOADABLE_STATS:
                 logger.warning("Ignoring unknown statistic %r in the import preferences.", name)
 
-    return ImportPreferences(start_date=start_date, enabled_stats=enabled)
+    stored_interval = raw.get("sync_interval_seconds")
+    if stored_interval is None:
+        # A file saved before this setting existed.
+        interval = defaults.sync_interval_seconds
+    elif not isinstance(stored_interval, int) or stored_interval <= 0:
+        logger.warning(
+            "Import preferences hold an unusable sync_interval_seconds %r; using %s.",
+            stored_interval,
+            defaults.sync_interval_seconds,
+        )
+        interval = defaults.sync_interval_seconds
+    else:
+        interval = stored_interval
+
+    return ImportPreferences(
+        start_date=start_date, enabled_stats=enabled, sync_interval_seconds=interval
+    )
 
 
 def save_preferences(settings: Settings, preferences: ImportPreferences) -> None:
@@ -170,6 +224,7 @@ def parse_preferences(
     *,
     start_date: str,
     stats: Iterable[str],
+    sync_interval: str | None = None,
     today: dt.date | None = None,
 ) -> ImportPreferences:
     """Validate owner-submitted form input. Raises :class:`InvalidPreferences`.
@@ -204,7 +259,30 @@ def parse_preferences(
         # Dropping it silently would leave the owner believing they enabled it.
         raise InvalidPreferences(f"Not a metric this service can download: {', '.join(unknown)}.")
 
-    return ImportPreferences(start_date=parsed, enabled_stats=frozenset(selected))
+    if sync_interval is None:
+        # Not submitted: keep whatever is saved rather than resetting it.
+        interval = load_preferences(settings).sync_interval_seconds
+    else:
+        try:
+            interval = int(str(sync_interval).strip())
+        except ValueError:
+            raise InvalidPreferences(
+                f"{sync_interval!r} is not a sync interval this service offers."
+            ) from None
+        if interval <= 0:
+            raise InvalidPreferences("A sync interval has to be a positive number of seconds.")
+        # The operator's own SYNC_INTERVAL_SECONDS is always acceptable, or
+        # re-saving the page would be refused whenever it names a value the form
+        # does not list.
+        if interval not in SYNC_INTERVAL_CHOICES and interval != settings.sync_interval_seconds:
+            raise InvalidPreferences(
+                f"Choose how often to sync from the list offered; "
+                f"{sync_interval_label(interval).lower()} is not one of them."
+            )
+
+    return ImportPreferences(
+        start_date=parsed, enabled_stats=frozenset(selected), sync_interval_seconds=interval
+    )
 
 
 def preferences_path(settings: Settings) -> Path:

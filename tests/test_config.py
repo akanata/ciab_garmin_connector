@@ -53,8 +53,17 @@ def test_is_cn_follows_domain() -> None:
     assert settings_from_env({}).is_cn is False
 
 
-def test_sync_interval_defaults_to_six_hours() -> None:
-    assert settings_from_env({}).sync_interval_seconds == 21600
+def test_sync_interval_defaults_to_one_hour() -> None:
+    """Freshness is capped by how often the watch syncs to Garmin Connect through
+    the phone, so much shorter buys little -- but six hours left last night's
+    sleep missing for most of a morning."""
+    assert settings_from_env({}).sync_interval_seconds == 3600
+
+
+def test_sync_state_lives_under_app_data(settings: Settings) -> None:
+    """When the last sync started has to survive a restart. Without it every deploy
+    waits out a whole interval, and a crash loop would sign in on every restart."""
+    assert settings.sync_state_file == settings.app_data_dir / "sync_state.json"
 
 
 def test_sync_interval_is_read_from_env() -> None:
@@ -69,7 +78,7 @@ def test_bad_sync_interval_fails_loudly(bad: str) -> None:
 
 def test_empty_sync_interval_means_unset() -> None:
     """Compose and the router both export empty strings for unset variables."""
-    assert settings_from_env({"SYNC_INTERVAL_SECONDS": ""}).sync_interval_seconds == 21600
+    assert settings_from_env({"SYNC_INTERVAL_SECONDS": ""}).sync_interval_seconds == 3600
 
 
 def test_home_tz_is_validated_as_a_real_zone() -> None:

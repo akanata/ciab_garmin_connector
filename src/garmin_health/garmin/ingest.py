@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import shutil
 from collections.abc import Callable
 from threading import Event
 from typing import Any
@@ -44,6 +45,7 @@ from garmindb.garmindb import Sleep
 from garmindb.garmindb import SleepEvents
 
 from garmin_health.config import Settings
+from garmin_health.garmin.timezone_probe import read_stored_time_zone
 from garmin_health.garmin_config import load_manager
 
 # TableStat is a plain value object on the port between sync.py and this adapter;
@@ -55,6 +57,8 @@ from garmin_health.sync import StatCoverage
 from garmin_health.sync import TableStat
 from garmin_health.sync import _no_progress
 from garmin_health.sync import incremental_range
+from garmin_health.timezones import TimeZoneUnresolved
+from garmin_health.timezones import resolve_home_tz
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +80,10 @@ STAT_TABLES: dict[str, tuple[str, Any, Any]] = {
     "rhr": ("garmin", RestingHeartRate, RestingHeartRate.resting_heart_rate),
     "hrv": ("garmin", Hrv, Hrv.day),
 }
+
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
 
 
 def _refuse_mfa() -> str:
@@ -108,8 +116,15 @@ class Bindings:
 class GarminDbIngest:
     """One sync's worth of GarminDB work. Every method blocks; never call on the loop."""
 
-    def __init__(self, settings: Settings, *, bindings: Bindings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        bindings: Bindings | None = None,
+        clock: Callable[[], dt.datetime] = _utcnow,
+    ) -> None:
         self._settings = settings
+        self._clock = clock
         self._bindings = bindings or Bindings()
         # load_manager validates and repairs the JSON first: the bare
         # GarminConnectConfigManager calls sys.exit(-1) on a malformed config,
@@ -209,29 +224,47 @@ class GarminDbIngest:
 
     # -- download -------------------------------------------------------------
 
+    def _home_today(self) -> dt.date:
+        """Today on the Garmin account's calendar, which is what Garmin keys days by.
+
+        Never the container's date: the Dockerfile bootstraps ``TZ=UTC``, and a UTC
+        date is a day ahead for a western evening and a day behind for an eastern
+        morning -- either asking for a calendarDate not yet begun, or missing the
+        night that just ended.
+
+        Before the first profile import there may be no zone to resolve. This is a
+        download *range*, not a timestamp conversion, so falling back to the UTC
+        date corrupts nothing: at worst the edge day lands one sync later, and this
+        same sync imports the zone that fixes it.
+        """
+        now = self._clock()
+        try:
+            zone = resolve_home_tz(
+                configured=self._settings.home_tz, stored=read_stored_time_zone(self._garmin_db)
+            )
+        except TimeZoneUnresolved as exc:
+            logger.warning(
+                "Home timezone not known yet (%s); planning downloads against the UTC date "
+                "until the profile import supplies it.",
+                exc,
+            )
+            return now.astimezone(dt.UTC).date()
+        return now.astimezone(zone).date()
+
     def download_plan(self, *, today: dt.date | None = None) -> dict[str, tuple[dt.date, int]]:
-        """Per-stat (start date, days), using GarminDB's own incremental rule."""
-        today = today or dt.date.today()
-        sources: dict[str, tuple[Any, Any, Any]] = {
-            "monitoring": (
-                self._monitoring_db,
-                MonitoringHeartRate,
-                MonitoringHeartRate.heart_rate,
-            ),
-            "sleep": (self._garmin_db, Sleep, Sleep.total_sleep),
-            "rhr": (self._garmin_db, RestingHeartRate, RestingHeartRate.resting_heart_rate),
-            "hrv": (self._garmin_db, Hrv, Hrv.day),
-        }
+        """Per-stat ``(start, days)``, forward from the newest row through today."""
+        today = today or self._home_today()
         plan: dict[str, tuple[dt.date, int]] = {}
         for stat in self._config.enabled_stats():
-            source = sources.get(stat.name)
+            source = STAT_TABLES.get(stat.name)
             if source is None:
                 continue
-            db, table, column = source
+            kind, table, column = source
+            floor, _ = self._config.stat_start_date(stat.name)
             plan[stat.name] = incremental_range(
-                latest=table.latest_time(db, column),
+                latest=table.latest_time(self._db_for(kind), column),
                 today=today,
-                fallback=self._config.stat_start_date(stat.name),
+                floor=floor,
             )
         return plan
 
@@ -248,13 +281,30 @@ class GarminDbIngest:
         if stat == "monitoring":
             download.get_daily_summaries(self._config.get_monitoring_dir, date, days, False)
             download.get_hydration(self._config.get_monitoring_dir, date, days, False)
-            download.get_monitoring(self._config.get_monitoring_dir, date, days)
+            # A day per call, because Download.get_monitoring makes a mkdtemp() for
+            # each day, leaves that day's wellness zip in it, never removes it, and
+            # keeps only the *last* one on download.temp_dir. Every sync re-fetches
+            # the recent days, so a long-lived container's /tmp would otherwise grow
+            # without bound -- faster the more often the sync runs. One day per call
+            # makes download.temp_dir exactly the directory to remove.
+            for offset in range(days):
+                download.get_monitoring(
+                    self._config.get_monitoring_dir, date + dt.timedelta(days=offset), 1
+                )
+                self._discard_temp_dir(download)
         elif stat == "sleep":
             download.get_sleep(self._config.get_sleep_dir(), date, days, False)
         elif stat == "rhr":
             download.get_rhr(self._config.get_rhr_dir(), date, days, False)
         elif stat == "hrv":
             download.get_hrv(self._config.get_rhr_dir(), date, days, False)
+
+    @staticmethod
+    def _discard_temp_dir(download: Any) -> None:
+        """Remove the scratch directory GarminDB left behind for one wellness zip."""
+        temp_dir = getattr(download, "temp_dir", None)
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _login(self) -> Any:
         download = self._make_download()

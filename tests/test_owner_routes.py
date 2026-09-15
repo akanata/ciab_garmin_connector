@@ -16,6 +16,7 @@ from garmin_health.config import Settings
 from garmin_health.garmin_config import read_config
 from garmin_health.preferences import DOWNLOADABLE_STATS
 from garmin_health.preferences import STAT_LABELS
+from garmin_health.preferences import SYNC_INTERVAL_CHOICES
 from garmin_health.preferences import ImportPreferences
 from garmin_health.preferences import load_preferences
 from garmin_health.preferences import save_preferences
@@ -755,3 +756,71 @@ def test_the_mint_snippet_matches_the_installed_library() -> None:
     assert 'Garmin("you@example.com", "your-password")' in MINT_SNIPPET
     parameters = list(inspect.signature(Garmin.__init__).parameters)
     assert parameters[1:3] == ["email", "password"]
+
+
+class TestSyncIntervalControl:
+    """How often the background sync runs, chosen on /setup."""
+
+    def test_the_form_offers_the_intervals_with_the_saved_one_selected(
+        self, settings: Settings
+    ) -> None:
+        save_preferences(
+            settings,
+            ImportPreferences(
+                start_date=dt.date(2024, 3, 1),
+                enabled_stats=frozenset({"sleep"}),
+                sync_interval_seconds=1800,
+            ),
+        )
+        client, _ = linked_client(settings)
+        with client:
+            page = client.get("/setup", headers=OWNER).text
+        assert "name='sync_interval'" in page
+        assert "value='1800' selected" in page
+        for seconds in SYNC_INTERVAL_CHOICES:
+            assert f"value='{seconds}'" in page
+
+    def test_saving_a_new_interval_takes_effect(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            client.post(
+                "/setup/import",
+                data={"start_date": "2025-02-01", "stats": ["sleep"], "sync_interval": "900"},
+                headers=OWNER,
+            )
+            status = client.get("/sync/status", headers=OWNER).json()
+        assert load_preferences(settings).sync_interval_seconds == 900
+        assert status["interval_seconds"] == 900
+
+    def test_an_interval_not_offered_is_refused(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            response = client.post(
+                "/setup/import",
+                data={"start_date": "2025-02-01", "stats": ["sleep"], "sync_interval": "60"},
+                headers=OWNER,
+            )
+        assert response.status_code == 400
+        assert load_preferences(settings).sync_interval_seconds == settings.sync_interval_seconds
+
+    def test_the_page_says_when_the_next_automatic_sync_is(self, settings: Settings) -> None:
+        """Whether a sync needs pressing at all should not need reading the code."""
+        client, _ = linked_client(settings)
+        with client:
+            client.post("/sync", headers=OWNER)
+            wait_for_sync(client)
+            page = client.get("/setup", headers=OWNER).text
+        assert "Next automatic sync" in page
+
+    def test_before_any_sync_the_page_says_one_is_on_its_way(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            page = client.get("/setup", headers=OWNER).text
+        assert "automatic sync" in page.lower()
+
+    def test_status_reports_when_the_next_sync_is_due(self, settings: Settings) -> None:
+        client, _ = linked_client(settings)
+        with client:
+            client.post("/sync", headers=OWNER)
+            body = wait_for_sync(client)
+        assert body["next_sync_at"] is not None

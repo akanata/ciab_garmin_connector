@@ -31,6 +31,7 @@ from litestar.datastructures import State
 from garmin_health.auth import GarminAuthenticator
 from garmin_health.config import Settings
 from garmin_health.config import settings_from_env
+from garmin_health.preferences import load_preferences
 from garmin_health.routes.owner import owner_router
 from garmin_health.routes.service import v1_router
 from garmin_health.sync import Ingest
@@ -96,6 +97,9 @@ def create_app(
         authenticator=authenticator,
         ingest_factory=ingest_factory or _default_ingest_factory(settings),
         on_corpus_changed=on_corpus_changed,
+        # The owner's saved interval, read fresh each time the loop decides when to
+        # sync next; SYNC_INTERVAL_SECONDS only seeds it.
+        interval=lambda: load_preferences(settings).sync_interval_seconds,
     )
     state["sync_engine"] = engine
 

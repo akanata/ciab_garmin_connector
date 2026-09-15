@@ -11,6 +11,7 @@ import pytest
 
 from garmin_health.config import Settings
 from garmin_health.preferences import DOWNLOADABLE_STATS
+from garmin_health.preferences import SYNC_INTERVAL_CHOICES
 from garmin_health.preferences import ImportPreferences
 from garmin_health.preferences import InvalidPreferences
 from garmin_health.preferences import load_preferences
@@ -139,3 +140,90 @@ def test_preferences_render_the_garmindb_date_format(settings: Settings) -> None
     reaches sys.exit(-1) if it fails."""
     prefs = ImportPreferences(start_date=dt.date(2024, 3, 1), enabled_stats=frozenset())
     assert dateutil.parser.parse(prefs.start_date_text).date() == dt.date(2024, 3, 1)
+
+
+class TestSyncInterval:
+    """How often the background sync runs, set by the owner on /setup."""
+
+    def test_the_env_var_seeds_the_default(self, tmp_path: Path) -> None:
+        settings = Settings(app_data_dir=tmp_path / "a", sync_interval_seconds=1800)
+        assert load_preferences(settings).sync_interval_seconds == 1800
+
+    def test_it_round_trips(self, settings: Settings) -> None:
+        prefs = ImportPreferences(
+            start_date=dt.date(2024, 3, 1),
+            enabled_stats=frozenset({"sleep"}),
+            sync_interval_seconds=900,
+        )
+        save_preferences(settings, prefs)
+        assert load_preferences(settings).sync_interval_seconds == 900
+
+    def test_a_file_saved_before_the_setting_existed_keeps_working(
+        self, settings: Settings
+    ) -> None:
+        settings.preferences_file.parent.mkdir(parents=True, exist_ok=True)
+        settings.preferences_file.write_text(
+            json.dumps({"start_date": "2024-01-01", "enabled_stats": ["sleep"]})
+        )
+        assert load_preferences(settings).sync_interval_seconds == settings.sync_interval_seconds
+
+    @pytest.mark.parametrize("bad", [0, -60, "hourly", None, 1.5, True])
+    def test_an_unusable_stored_interval_falls_back_to_the_default(
+        self, settings: Settings, bad: object
+    ) -> None:
+        settings.preferences_file.parent.mkdir(parents=True, exist_ok=True)
+        settings.preferences_file.write_text(
+            json.dumps(
+                {
+                    "start_date": "2024-01-01",
+                    "enabled_stats": ["sleep"],
+                    "sync_interval_seconds": bad,
+                }
+            )
+        )
+        assert load_preferences(settings).sync_interval_seconds == settings.sync_interval_seconds
+
+    def test_every_offered_choice_is_accepted(self, settings: Settings) -> None:
+        for seconds in SYNC_INTERVAL_CHOICES:
+            prefs = parse_preferences(
+                settings,
+                start_date="2024-03-01",
+                stats=["sleep"],
+                sync_interval=str(seconds),
+                today=TODAY,
+            )
+            assert prefs.sync_interval_seconds == seconds
+
+    @pytest.mark.parametrize("bad", ["60", "0", "-3600", "hourly", ""])
+    def test_an_interval_that_is_not_offered_is_refused(self, settings: Settings, bad: str) -> None:
+        """A one-minute sync would hit Garmin sixty times an hour. The form offers a
+        fixed set, so neither a typo nor a hand-crafted POST can do that."""
+        with pytest.raises(InvalidPreferences, match="sync"):
+            parse_preferences(
+                settings, start_date="2024-03-01", stats=["sleep"], sync_interval=bad, today=TODAY
+            )
+
+    def test_the_operators_env_value_is_accepted_even_if_not_offered(self, tmp_path: Path) -> None:
+        """Otherwise re-saving the page would be refused whenever
+        SYNC_INTERVAL_SECONDS names a value the form does not list."""
+        settings = Settings(app_data_dir=tmp_path / "a", sync_interval_seconds=7200)
+        prefs = parse_preferences(
+            settings, start_date="2024-03-01", stats=["sleep"], sync_interval="7200", today=TODAY
+        )
+        assert prefs.sync_interval_seconds == 7200
+
+    def test_omitting_the_interval_keeps_the_saved_one(self, settings: Settings) -> None:
+        save_preferences(
+            settings,
+            ImportPreferences(
+                start_date=dt.date(2024, 3, 1),
+                enabled_stats=frozenset({"sleep"}),
+                sync_interval_seconds=1800,
+            ),
+        )
+        prefs = parse_preferences(settings, start_date="2024-03-01", stats=["sleep"], today=TODAY)
+        assert prefs.sync_interval_seconds == 1800
+
+    def test_the_choices_never_go_below_fifteen_minutes(self) -> None:
+        assert min(SYNC_INTERVAL_CHOICES) == 15 * 60
+        assert list(SYNC_INTERVAL_CHOICES) == sorted(SYNC_INTERVAL_CHOICES)
