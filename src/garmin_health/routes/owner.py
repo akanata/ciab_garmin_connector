@@ -41,11 +41,13 @@ from garmin_health.garmin_config import ensure_config
 from garmin_health.preferences import DOWNLOADABLE_STATS
 from garmin_health.preferences import STAT_DETAIL
 from garmin_health.preferences import STAT_LABELS
+from garmin_health.preferences import SYNC_INTERVAL_CHOICES
 from garmin_health.preferences import ImportPreferences
 from garmin_health.preferences import InvalidPreferences
 from garmin_health.preferences import load_preferences
 from garmin_health.preferences import parse_preferences
 from garmin_health.preferences import save_preferences
+from garmin_health.preferences import sync_interval_label
 from garmin_health.sync import StatCoverage
 from garmin_health.sync import SyncEngine
 from garmin_health.sync import SyncStep
@@ -88,6 +90,25 @@ def _describe_last_sync(engine: SyncEngine) -> str:
     if not last["changed"]:
         return f"Last sync finished at {when} and added nothing new ({rows} rows held)."
     return f"Last sync finished at {when} ({rows} rows held)."
+
+
+def _describe_schedule(engine: SyncEngine) -> str:
+    """When the next automatic sync runs, so nobody has to wonder whether to press Sync."""
+    status = engine.status()
+    every = sync_interval_label(int(status["interval_seconds"])).lower()
+    next_at = status["next_sync_at"]
+    if next_at is None:
+        return escape(f"Syncs automatically {every}; the first automatic sync starts shortly.")
+    remaining = (dt.datetime.fromisoformat(next_at) - dt.datetime.now(dt.UTC)).total_seconds()
+    if remaining <= 60:
+        when = "shortly"
+    elif remaining < 60 * 60:
+        minutes = round(remaining / 60)
+        when = f"in about {minutes} minute{'' if minutes == 1 else 's'}"
+    else:
+        hours = round(remaining / (60 * 60))
+        when = f"in about {hours} hour{'' if hours == 1 else 's'}"
+    return escape(f"Next automatic sync {when} (syncs {every}).")
 
 
 @attrs.frozen
@@ -173,6 +194,7 @@ STYLE = (
     "body{font:16px/1.5 system-ui,sans-serif;margin:0 auto;padding:2rem;max-width:34rem}"
     "label{display:block;margin:.75rem 0}input{display:block;width:100%;padding:.5rem;margin-top:.25rem}"
     "button{padding:.5rem 1rem;margin-top:.5rem}"
+    "select{display:block;width:100%;padding:.5rem;margin-top:.25rem}"
     "textarea{display:block;width:100%;padding:.5rem;margin-top:.25rem;font-family:ui-monospace,"
     "monospace;font-size:.8rem}"
     "pre{background:#f1f5f9;padding:.75rem;overflow-x:auto;font-size:.8rem;border-radius:3px}"
@@ -209,8 +231,13 @@ def _button(label: str) -> str:
     return f"<button type='submit'><span class='spinner' aria-hidden='true'></span>{escape(label)}</button>"
 
 
+def _interval_options(current: int) -> list[int]:
+    """The offered intervals, plus the saved one if the operator set something else."""
+    return sorted(set(SYNC_INTERVAL_CHOICES) | {current})
+
+
 def _import_scope_form(view: PageView) -> str:
-    """The two knobs that decide how long a sync runs."""
+    """The three knobs that decide how much work importing does."""
     prefs = view.preferences
     boxes = []
     for stat in DOWNLOADABLE_STATS:
@@ -220,6 +247,12 @@ def _import_scope_form(view: PageView) -> str:
             f"{escape(STAT_LABELS[stat])}"
             f"<span class='note'>{escape(STAT_DETAIL[stat])}</span></label>"
         )
+
+    options = "".join(
+        f"<option value='{seconds}'{' selected' if seconds == prefs.sync_interval_seconds else ''}>"
+        f"{escape(sync_interval_label(seconds))}</option>"
+        for seconds in _interval_options(prefs.sync_interval_seconds)
+    )
 
     warning = ""
     if not prefs.enabled_stats:
@@ -232,18 +265,23 @@ def _import_scope_form(view: PageView) -> str:
         f"<p class='error' role='alert'>{escape(view.scope_error)}</p>" if view.scope_error else ""
     )
     return (
-        "<h2>Import scope</h2>"
-        "<p class='note'>Both of these decide how long a sync takes. A full history of "
-        "continuous heart rate is by far the slowest thing to fetch.</p>"
+        "<h2>Import settings</h2>"
+        "<p class='note'>The start date and metrics decide how long each sync takes; the "
+        "interval decides how often one runs. A full history of continuous heart rate is by far "
+        "the slowest thing to fetch.</p>"
         + error
         + "<form method='post' action='/setup/import' data-busy='Saving...'>"
         "<label>Earliest date to import from"
         f"<input type='date' name='start_date' value='{escape(prefs.start_date_text, quote=True)}'"
         f" max='{view.today.isoformat()}' required></label>"
+        "<label>Check Garmin for new data"
+        f"<select name='sync_interval'>{options}</select>"
+        "<span class='note'>Your watch only reaches Garmin Connect when it syncs with your "
+        "phone, so checking more often than that fetches nothing new.</span></label>"
         "<fieldset><legend>Metrics to import</legend>"
         + "".join(boxes)
         + "</fieldset>"
-        + _button("Save import scope")
+        + _button("Save import settings")
         + "</form>"
         + warning
     )
@@ -455,7 +493,7 @@ async def _page_view(
         # take_error(), not peek: rendering the failure consumes it, so refreshing
         # the page does not keep reporting a sign-in that failed once.
         error=authenticator.take_error() if consume_flash else authenticator.peek_error(),
-        sync_summary=_describe_last_sync(engine),
+        sync_summary=f"{_describe_last_sync(engine)} {_describe_schedule(engine)}",
         preferences=load_preferences(state.settings),
         coverage=coverage,
         step=engine.step,
@@ -485,14 +523,21 @@ async def submit_import_scope(
     # A single ticked checkbox arrives as a bare string, several as a list.
     stats = [raw_stats] if isinstance(raw_stats, str) else list(raw_stats)
     try:
+        raw_interval = data.get("sync_interval")
         preferences = parse_preferences(
-            state.settings, start_date=str(data.get("start_date", "")), stats=stats
+            state.settings,
+            start_date=str(data.get("start_date", "")),
+            stats=stats,
+            sync_interval=None if raw_interval is None else str(raw_interval),
         )
     except InvalidPreferences as exc:
         view = await _page_view(state, scope_error=str(exc), consume_flash=False)
         return Response(content=_render(view), media_type=MediaType.HTML, status_code=400)
 
     save_preferences(state.settings, preferences)
+    # Wake the loop, so a shorter interval applies now rather than after the long
+    # wait it may already be part-way through.
+    _sync_engine(state).reschedule()
     # Rewrite GarminConnectConfig.json now rather than at the next sync, so the
     # saved scope is what the next download reads even if this process restarts.
     ensure_config(state.settings, preferences=preferences)

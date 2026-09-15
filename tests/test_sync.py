@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import threading
 from threading import Event
 
@@ -27,42 +28,70 @@ from tests.fakes import RecordingFactory
 from tests.fakes import ReportingIngest
 
 TODAY = dt.date(2026, 6, 15)
+FLOOR = dt.date(2019, 12, 31)
 
 
 class TestIncrementalRange:
-    """GarminDB's own rule (garmindb_cli.py __get_date_and_days): start one day
-    before the newest row so a partially-downloaded day is refetched."""
+    """Which days a routine sync fetches.
 
-    def test_falls_back_to_the_configured_start_when_the_table_is_empty(self) -> None:
-        fallback = (dt.date(2019, 12, 31), 2444)
-        assert incremental_range(latest=None, today=TODAY, fallback=fallback) == fallback
+    GarminDB's own rule (garmindb_cli.py __get_date_and_days) starts a day before
+    the newest row but computes ``days = (today - start).days``, and its
+    downloaders loop ``range(0, days)`` -- so the last day it ever fetches is
+    *yesterday*. Last night's sleep (calendarDate today) and today's heart rate
+    were never downloaded, and no number of manual syncs could change that,
+    because every sync computed the same range. The range here includes today.
+    """
 
-    def test_starts_one_day_before_the_newest_row(self) -> None:
+    def test_an_empty_table_starts_at_the_floor(self) -> None:
+        start, _ = incremental_range(latest=None, today=TODAY, floor=dt.date(2026, 6, 1))
+        assert start == dt.date(2026, 6, 1)
+
+    def test_it_starts_one_day_before_the_newest_row(self) -> None:
         latest = dt.datetime(2026, 6, 14, 23, 0)
-        assert incremental_range(latest=latest, today=TODAY, fallback=(TODAY, 1)) == (
+        assert incremental_range(latest=latest, today=TODAY, floor=FLOOR) == (
             dt.date(2026, 6, 13),
-            2,
+            3,
         )
 
     def test_accepts_a_date_as_well_as_a_datetime(self) -> None:
         """Sleep.day and Hrv.day come back as dates on some SQLite paths."""
-        assert incremental_range(latest=dt.date(2026, 6, 14), today=TODAY, fallback=(TODAY, 1)) == (
+        assert incremental_range(latest=dt.date(2026, 6, 14), today=TODAY, floor=FLOOR) == (
             dt.date(2026, 6, 13),
-            2,
+            3,
         )
 
-    def test_a_table_current_to_today_still_refetches_yesterday(self) -> None:
+    def test_a_table_current_to_today_refetches_yesterday_and_today(self) -> None:
+        """Both can be partial: yesterday's file changes when the watch syncs
+        overnight, and today's changes all day long."""
         assert incremental_range(
-            latest=dt.datetime(2026, 6, 15, 8, 0), today=TODAY, fallback=(TODAY, 1)
-        ) == (
-            dt.date(2026, 6, 14),
-            1,
-        )
+            latest=dt.datetime(2026, 6, 15, 8, 0), today=TODAY, floor=FLOOR
+        ) == (dt.date(2026, 6, 14), 2)
+
+    @pytest.mark.parametrize(
+        "latest",
+        [
+            None,
+            dt.date(2026, 5, 1),
+            dt.datetime(2026, 6, 14, 23, 59),
+            dt.datetime(2026, 6, 15, 0, 5),
+        ],
+    )
+    def test_the_last_day_fetched_is_always_today(
+        self, latest: dt.datetime | dt.date | None
+    ) -> None:
+        """Downloaders loop range(0, days), so the last day fetched is
+        start + days - 1. That has to be today, whatever the table holds."""
+        start, days = incremental_range(latest=latest, today=TODAY, floor=dt.date(2026, 1, 1))
+        assert start + dt.timedelta(days=days - 1) == TODAY
 
     def test_a_future_row_yields_no_days_rather_than_a_negative_span(self) -> None:
         """A clock skew or a travelling watch must not ask Garmin for -3 days."""
         latest = dt.datetime(2026, 6, 20, 8, 0)
-        _, days = incremental_range(latest=latest, today=TODAY, fallback=(TODAY, 1))
+        _, days = incremental_range(latest=latest, today=TODAY, floor=FLOOR)
+        assert days == 0
+
+    def test_a_floor_in_the_future_yields_no_days(self) -> None:
+        _, days = incremental_range(latest=None, today=TODAY, floor=dt.date(2026, 7, 1))
         assert days == 0
 
 
@@ -79,6 +108,8 @@ def make_engine(
     ingest: FakeIngest | None = None,
     linked: bool = True,
     interval: int = 3600,
+    startup_grace: float = 0.0,
+    min_gap: float = 0.0,
 ) -> tuple[SyncEngine, FakeIngest, GarminAuthenticator]:
     ingest = ingest or FakeIngest()
     auth = (
@@ -90,6 +121,8 @@ def make_engine(
         settings=Settings(app_data_dir=settings.app_data_dir, sync_interval_seconds=interval),
         authenticator=auth,
         ingest_factory=lambda: ingest,
+        startup_grace_seconds=startup_grace,
+        min_gap_seconds=min_gap,
     )
     return engine, ingest, auth
 
@@ -248,43 +281,160 @@ class TestStatus:
         assert report.finished_at is not None and report.finished_at.tzinfo is dt.UTC
 
 
-class TestLoop:
-    async def test_sleeps_before_the_first_sync(self, settings: Settings) -> None:
-        """Otherwise a crash-looping container would hammer Garmin's SSO on every
-        restart, which is a good way to get an account throttled."""
-        engine, ingest, _ = make_engine(settings, interval=3600)
+def plant_last_start(settings: Settings, when: dt.datetime) -> None:
+    """What a previous process left behind."""
+    settings.sync_state_file.parent.mkdir(parents=True, exist_ok=True)
+    settings.sync_state_file.write_text(json.dumps({"last_started_at": when.isoformat()}))
+
+
+async def run_loop_for(engine: SyncEngine, seconds: float) -> None:
+    task = asyncio.create_task(engine.run_forever())
+    await asyncio.sleep(seconds)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+class TestSchedule:
+    """When the background loop syncs.
+
+    It used to sleep a whole interval before its first sync and remember nothing
+    across restarts, so every deploy waited out a full interval. The start of each
+    sync is persisted instead. That keeps the one thing the delay was for -- a
+    crash-looping container must not sign in on every restart -- without making a
+    healthy restart wait.
+    """
+
+    async def test_a_never_synced_container_waits_only_the_grace(self, settings: Settings) -> None:
+        engine, ingest, _ = make_engine(settings, interval=3600, startup_grace=0.05)
         task = asyncio.create_task(engine.run_forever())
-        await asyncio.sleep(0.05)
-        assert ingest.calls == []
+        await asyncio.sleep(0.01)
+        assert "download" not in ingest.calls
+        await asyncio.sleep(0.2)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+        assert "download" in ingest.calls
 
-    async def test_syncs_once_per_interval(self, settings: Settings) -> None:
-        engine, ingest, _ = make_engine(settings, interval=0)
+    async def test_a_restart_right_after_a_sync_waits_out_the_interval(
+        self, settings: Settings
+    ) -> None:
+        """The crash-loop case. A start recorded seconds ago means no sign-in, however
+        often the container restarts."""
+        plant_last_start(settings, dt.datetime.now(dt.UTC) - dt.timedelta(seconds=10))
+        engine, ingest, _ = make_engine(settings, interval=3600)
+        await run_loop_for(engine, 0.1)
+        assert ingest.calls == []
+
+    async def test_an_overdue_restart_syncs_without_waiting_an_interval(
+        self, settings: Settings
+    ) -> None:
+        """The deploy case. The last sync was hours ago, so there is nothing to
+        protect and no reason to wait."""
+        plant_last_start(settings, dt.datetime.now(dt.UTC) - dt.timedelta(hours=2))
+        engine, ingest, _ = make_engine(settings, interval=3600)
+        await run_loop_for(engine, 0.1)
+        assert "download" in ingest.calls
+
+    async def test_the_start_is_recorded_before_any_garmin_work(self, settings: Settings) -> None:
+        """A sync that takes the process down part-way still has to count, or the
+        restart would sign in again at once."""
+        release = Event()
+        engine, _, _ = make_engine(settings, ingest=FakeIngest(block_on=release))
+        assert await engine.trigger() is True
+        await asyncio.sleep(0.05)
+        try:
+            assert settings.sync_state_file.exists()
+        finally:
+            release.set()
+            await engine.wait_for_idle()
+
+    async def test_the_recorded_start_carries_into_a_new_process(self, settings: Settings) -> None:
+        engine, _, _ = make_engine(settings, interval=3600)
+        await engine.run_once()
+        started = dt.datetime.fromisoformat(engine.status()["last_sync"]["started_at"])
+
+        fresh, _, _ = make_engine(settings, interval=3600)
+        next_at = dt.datetime.fromisoformat(fresh.status()["next_sync_at"])
+        assert next_at == started + dt.timedelta(hours=1)
+
+    async def test_a_backfill_does_not_move_the_schedule(self, settings: Settings) -> None:
+        """The schedule is for fetching new data. A backfill fetches old history and
+        says nothing about how fresh the corpus is."""
+        engine, _, _ = make_engine(settings)
+        await engine.run_once(backfill=True)
+        assert engine.status()["next_sync_at"] is None
+        assert not settings.sync_state_file.exists()
+
+    async def test_a_manual_sync_pushes_the_next_scheduled_one_back(
+        self, settings: Settings
+    ) -> None:
+        """Otherwise Sync now could be followed minutes later by a scheduled sync
+        fetching exactly the same days."""
+        engine, _, _ = make_engine(settings, interval=3600)
+        assert await engine.trigger() is True
+        await engine.wait_for_idle()
+        next_at = dt.datetime.fromisoformat(engine.status()["next_sync_at"])
+        assert next_at > dt.datetime.now(dt.UTC) + dt.timedelta(minutes=59)
+
+    async def test_an_interval_change_does_not_wait_out_the_old_one(
+        self, settings: Settings
+    ) -> None:
+        """Shortening the interval on /setup must not first sleep through the long
+        wait the loop had already begun."""
+        interval = {"seconds": 3600}
+        plant_last_start(settings, dt.datetime.now(dt.UTC) - dt.timedelta(minutes=30))
+        ingest = FakeIngest()
+        engine = SyncEngine(
+            settings=Settings(app_data_dir=settings.app_data_dir),
+            authenticator=linked_authenticator(settings),
+            ingest_factory=lambda: ingest,
+            interval=lambda: interval["seconds"],
+            startup_grace_seconds=0,
+            min_gap_seconds=0,
+        )
         task = asyncio.create_task(engine.run_forever())
+        await asyncio.sleep(0.05)
+        assert ingest.calls == []
+
+        interval["seconds"] = 900
+        engine.reschedule()
         await asyncio.sleep(0.1)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert ingest.calls.count("download") >= 1
+        assert "download" in ingest.calls
 
-    async def test_skips_the_interval_while_unlinked(self, settings: Settings) -> None:
+    async def test_status_reports_the_interval_in_force(self, settings: Settings) -> None:
+        engine = SyncEngine(
+            settings=Settings(app_data_dir=settings.app_data_dir),
+            authenticator=linked_authenticator(settings),
+            ingest_factory=lambda: FakeIngest(),
+            interval=lambda: 900,
+        )
+        assert engine.status()["interval_seconds"] == 900
+
+    async def test_a_corrupt_state_file_counts_as_never_synced(self, settings: Settings) -> None:
+        """A half-written file must not stop scheduling for the life of the container."""
+        settings.sync_state_file.parent.mkdir(parents=True, exist_ok=True)
+        settings.sync_state_file.write_text("{not json")
+        engine, ingest, _ = make_engine(settings, interval=3600)
+        await run_loop_for(engine, 0.1)
+        assert "download" in ingest.calls
+
+    async def test_it_keeps_syncing_once_per_interval(self, settings: Settings) -> None:
+        engine, ingest, _ = make_engine(settings, interval=0)
+        await run_loop_for(engine, 0.1)
+        assert ingest.calls.count("download") >= 2
+
+    async def test_it_does_nothing_while_unlinked(self, settings: Settings) -> None:
         engine, ingest, _ = make_engine(settings, linked=False, interval=0)
-        task = asyncio.create_task(engine.run_forever())
-        await asyncio.sleep(0.05)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        await run_loop_for(engine, 0.05)
         assert ingest.calls == []
 
     async def test_a_failing_sync_does_not_kill_the_loop(self, settings: Settings) -> None:
         engine, ingest, _ = make_engine(settings, ingest=FakeIngest(fail_on="download"), interval=0)
-        task = asyncio.create_task(engine.run_forever())
-        await asyncio.sleep(0.1)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        await run_loop_for(engine, 0.1)
         assert ingest.calls.count("download") >= 2
 
 

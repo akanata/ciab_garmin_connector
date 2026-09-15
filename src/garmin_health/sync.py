@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
+import os
+import secrets
 import time
 from collections.abc import Callable
 from collections.abc import Mapping
@@ -43,6 +46,15 @@ logger = logging.getLogger(__name__)
 # enough that a finished sync shows up on the next refresh, long enough that
 # holding the page open does not rebuild an ingest every few seconds.
 COVERAGE_TTL_SECONDS = 30.0
+
+# The first automatic sync after a start waits at least this long. A container
+# that crash-loops before it has ever recorded a sync can therefore sign in to
+# Garmin at most about once a minute.
+STARTUP_GRACE_SECONDS = 60.0
+# Never start a scheduled sync sooner than this after the previous one, even when
+# a run outlasted the interval -- otherwise an over-long run would chain straight
+# into the next.
+MIN_GAP_SECONDS = 300.0
 
 
 class SyncPhase(StrEnum):
@@ -194,21 +206,32 @@ def incremental_range(
     *,
     latest: dt.datetime | dt.date | None,
     today: dt.date,
-    fallback: tuple[dt.date, int],
+    floor: dt.date,
 ) -> tuple[dt.date, int]:
-    """GarminDB's own incremental rule, from ``garmindb_cli.py``'s ``__get_date_and_days``.
+    """The ``(start, days)`` a routine sync fetches for one statistic, **including today**.
 
-    Start one day *before* the newest row, because the last download may have
-    captured a partial day. With no rows at all, fall back to the configured
-    ``<stat>_start_date``. This is what makes routine syncs cheap.
+    Starts one day *before* the newest row, because the last download may have
+    captured a partial day; with no rows at all, starts at the owner's ``floor``.
+
+    ``days`` counts through today inclusive. GarminDB's downloaders loop
+    ``range(0, days)``, so the last day fetched is ``start + days - 1``. GarminDB's
+    own CLI rule (``garmindb_cli.py`` ``__get_date_and_days``) computes
+    ``(today - start).days`` -- and ``GarminConnectConfigManager.stat_start_date``
+    does the same for a first backfill -- so the last day it ever fetches is
+    *yesterday*. Last night's sleep carries today's calendarDate and this
+    morning's heart rate is in today's wellness file; neither was downloaded, and
+    no number of manual syncs could change that because each computed the same
+    range. GarminDB's own ``__get_stat`` comment ("always overwrite for yesterday
+    and today") shows today was always meant to be in it.
     """
     if latest is None:
-        return fallback
-    latest_date = latest.date() if isinstance(latest, dt.datetime) else latest
-    start = latest_date - dt.timedelta(days=1)
+        start = floor
+    else:
+        latest_date = latest.date() if isinstance(latest, dt.datetime) else latest
+        start = latest_date - dt.timedelta(days=1)
     # Clamped: a clock skew or a future-dated row must not ask Garmin for a
     # negative span, which Download would loop over zero times but report oddly.
-    return start, max((today - start).days, 0)
+    return start, max((today - start).days + 1, 0)
 
 
 def _utcnow() -> dt.datetime:
@@ -226,8 +249,17 @@ class SyncEngine:
         ingest_factory: Callable[[], Ingest],
         clock: Callable[[], dt.datetime] = _utcnow,
         on_corpus_changed: Callable[[], None] | None = None,
+        interval: Callable[[], int] | None = None,
+        startup_grace_seconds: float = STARTUP_GRACE_SECONDS,
+        min_gap_seconds: float = MIN_GAP_SECONDS,
     ) -> None:
         self._settings = settings
+        # Re-read on every scheduling decision, so a change on /setup applies
+        # without a restart. Defaults to the environment for callers with no
+        # saved preferences to consult.
+        self._interval: Callable[[], int] = interval or (lambda: settings.sync_interval_seconds)
+        self._startup_grace = startup_grace_seconds
+        self._min_gap = min_gap_seconds
         self._auth = authenticator
         self._ingest_factory = ingest_factory
         self._clock = clock
@@ -247,6 +279,69 @@ class SyncEngine:
         self._step: SyncStep | None = None
         self._coverage: dict[str, StatCoverage] | None = None
         self._coverage_at = 0.0
+        # Set to make the loop recompute its wait: the interval changed, or a sync
+        # started and moved the schedule.
+        self._wake = asyncio.Event()
+        self._last_started_at = self._load_last_started()
+
+    def _load_last_started(self) -> dt.datetime | None:
+        """When the last forward sync started, possibly in a previous process.
+
+        Anything unreadable counts as never synced. The cost is one sync after the
+        startup grace; the alternative is a half-written file silently disabling
+        scheduling for the life of the container.
+        """
+        path = self._settings.sync_state_file
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            started = dt.datetime.fromisoformat(raw["last_started_at"])
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("Ignoring unreadable sync state at %s: %s", path, exc)
+            return None
+        if started.tzinfo is None:
+            logger.warning("Ignoring a naive last_started_at in the sync state at %s.", path)
+            return None
+        return started
+
+    def _record_start(self, started: dt.datetime) -> None:
+        """Persist a forward sync's start, *before* any Garmin work.
+
+        First, so that a sync which takes the process down part-way still counts:
+        the restart then sees a recent start and waits out the interval instead of
+        signing in to Garmin again straight away.
+        """
+        self._last_started_at = started
+        path = self._settings.sync_state_file
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps({"last_started_at": started.isoformat()}), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            # Still held in memory, so this process stays protected; only a restart
+            # would lose it.
+            tmp.unlink(missing_ok=True)
+            logger.warning("Could not persist the sync start to %s: %s", path, exc)
+        self._wake.set()
+
+    def reschedule(self) -> None:
+        """Make the loop work out its next sync again, e.g. after the interval changed."""
+        self._wake.set()
+
+    def _seconds_until_due(self) -> float:
+        if self._last_started_at is None:
+            return 0.0
+        elapsed = (self._clock() - self._last_started_at).total_seconds()
+        return max(self._interval() - elapsed, 0.0)
+
+    @property
+    def next_sync_at(self) -> dt.datetime | None:
+        """When the next scheduled sync is due, or None before the first one."""
+        if self._last_started_at is None:
+            return None
+        return self._last_started_at + dt.timedelta(seconds=self._interval())
 
     @property
     def is_running(self) -> bool:
@@ -300,10 +395,12 @@ class SyncEngine:
 
     def status(self) -> dict[str, Any]:
         step = self.step
+        next_at = self.next_sync_at
         return {
             "link_state": self._auth.status().state.value,
             "running": self.is_running,
-            "interval_seconds": self._settings.sync_interval_seconds,
+            "interval_seconds": self._interval(),
+            "next_sync_at": next_at.isoformat() if next_at else None,
             "progress": step.as_dict() if step else None,
             "last_sync": self._last.as_dict() if self._last else None,
         }
@@ -363,8 +460,12 @@ class SyncEngine:
 
         async with self._lock:
             self._stop.clear()
-            ingest = self._ingest_factory()
             started = self._clock()
+            # Only a forward sync moves the schedule. A backfill fetches old history
+            # and says nothing about how fresh the corpus is.
+            if not backfill:
+                self._record_start(started)
+            ingest = self._ingest_factory()
             phase: SyncPhase | None = None
             error: str | None = None
             before: dict[str, TableStat] = {}
@@ -503,14 +604,28 @@ class SyncEngine:
         return await anyio.to_thread.run_sync(func, *args, abandon_on_cancel=True)
 
     async def run_forever(self) -> None:
-        """Sleep, sync, repeat. Cancelled by the app lifespan.
+        """Sync whenever one is due. Cancelled by the app lifespan.
 
-        Sleeping first is deliberate: a crash-looping container would otherwise
-        replay a Garmin sign-in on every restart.
+        Due means a full interval has passed since the last forward sync *started*,
+        read from disk so it survives a restart. A start is recorded before any
+        Garmin work and the first sync after a start still waits a short grace, so a
+        crash-looping container sees a recent start and waits out the interval
+        rather than signing in on every restart -- while a healthy restart after a
+        long gap syncs within a minute instead of waiting a whole interval, which is
+        what the old sleep-first loop made every deploy do.
         """
-        logger.info("Sync loop started; interval %ss.", self._settings.sync_interval_seconds)
+        logger.info("Sync loop started; interval %ss.", self._interval())
+        floor = self._startup_grace
         while True:
-            await asyncio.sleep(self._settings.sync_interval_seconds)
+            self._wake.clear()
+            wait = max(self._seconds_until_due(), floor)
+            if await self._sleep_unless_woken(wait):
+                # The interval changed, or a manual sync moved the schedule. Either
+                # way the wait has to be worked out again rather than slept through.
+                continue
+            floor = self._min_gap
+            if self._seconds_until_due() > 0:
+                continue
             try:
                 await self.run_once()
             except asyncio.CancelledError:
@@ -519,3 +634,11 @@ class SyncEngine:
                 # run_once records its own failures; this is belt and braces so a
                 # bug in the reporting path cannot kill the loop for good.
                 logger.exception("Unexpected error in the sync loop; continuing.")
+
+    async def _sleep_unless_woken(self, seconds: float) -> bool:
+        """Sleep up to ``seconds``. True if :meth:`reschedule` cut it short."""
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=seconds)
+        except TimeoutError:
+            return False
+        return True

@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import sqlite3
+import tempfile
 from pathlib import Path
 from threading import Event
 
@@ -16,6 +17,7 @@ import pytest
 from garmindb.garmindb import Attributes
 
 from garmin_health.config import Settings
+from garmin_health.garmin import ingest as ingest_module
 from garmin_health.garmin.ingest import Bindings
 from garmin_health.garmin.ingest import GarminDbIngest
 from garmin_health.garmin_config import ensure_config
@@ -52,7 +54,10 @@ class FakeDownload:
         *,
         login_ok: bool = True,
         calls: list[tuple[str, dt.date, int]] | None = None,
+        temp_dirs: list[str] | None = None,
     ) -> None:
+        self.temp_dirs = temp_dirs
+        self.temp_dir: str | None = None
         self.log = log
         self.login_ok = login_ok
         # _make_download() builds a fresh instance per call, so a shared list is
@@ -75,6 +80,13 @@ class FakeDownload:
         self._record("hydration", date, days)
 
     def get_monitoring(self, directory_func, date, days):  # noqa: ANN001, ANN201
+        # Mirrors download.py: a fresh mkdtemp() per day holding that day's
+        # wellness zip, never removed, with only the last kept on self.temp_dir.
+        for offset in range(days):
+            self.temp_dir = tempfile.mkdtemp(prefix="garmin-fake-wellness-")
+            (Path(self.temp_dir) / f"{date + dt.timedelta(days=offset)}.zip").write_bytes(b"")
+            if self.temp_dirs is not None:
+                self.temp_dirs.append(self.temp_dir)
         self._record("monitoring", date, days)
 
     def get_sleep(self, directory, date, days, overwrite):  # noqa: ANN001, ANN201
@@ -106,6 +118,7 @@ def make_ingest(
     login_ok: bool = True,
     sleep_json_files: int | None = None,
     calls: list[tuple[str, dt.date, int]] | None = None,
+    temp_dirs: list[str] | None = None,
 ) -> GarminDbIngest:
     settings = Settings(app_data_dir=tmp_path / "appdata")
     ensure_config(settings, user="rider@example.com")
@@ -114,7 +127,9 @@ def make_ingest(
         return lambda *a, **k: FakeStep(name, log, files=count)
 
     bindings = Bindings(
-        download=lambda gc_config: FakeDownload(log, login_ok=login_ok, calls=calls),
+        download=lambda gc_config: FakeDownload(
+            log, login_ok=login_ok, calls=calls, temp_dirs=temp_dirs
+        ),
         user_settings=step("user_settings"),
         personal_information=step("personal_information"),
         social_profile=step("social_profile"),
@@ -179,14 +194,106 @@ class TestDownloadPlan:
         build_fixture(settings.health_data_dir, nights=2, last_wake_day=dt.date(2026, 6, 15))
 
         plan = GarminDbIngest(settings).download_plan(today=dt.date(2026, 6, 16))
-        # Newest sleep.day is 2026-06-15, so start one day before it.
-        assert plan["sleep"] == (dt.date(2026, 6, 14), 2)
+        # Newest sleep.day is 2026-06-15: start one day before it, through today.
+        assert plan["sleep"] == (dt.date(2026, 6, 14), 3)
+
+    def test_last_nights_sleep_and_todays_heart_rate_are_in_the_plan(self, tmp_path: Path) -> None:
+        """The reported bug, end to end. The corpus holds up to yesterday; Garmin
+        Connect already shows last night (calendarDate today) and this morning's
+        heart rate. Every stat's range has to reach today."""
+        settings = Settings(app_data_dir=tmp_path / "appdata")
+        ensure_config(settings, user="rider@example.com")
+        build_fixture(
+            settings.health_data_dir,
+            nights=3,
+            last_wake_day=dt.date(2026, 9, 14),
+            heart_rate=True,
+            resting_hr=True,
+        )
+        plan = GarminDbIngest(settings).download_plan(today=dt.date(2026, 9, 15))
+        for stat, (start, days) in plan.items():
+            assert start + dt.timedelta(days=days - 1) == dt.date(2026, 9, 15), stat
+
+    def test_an_empty_corpus_backfill_reaches_today_too(self, tmp_path: Path) -> None:
+        """GarminConnectConfigManager.stat_start_date computes its span with the
+        same exclusive arithmetic, so even a first backfill stopped at yesterday."""
+        settings = Settings(app_data_dir=tmp_path / "appdata")
+        ensure_config(settings, user="rider@example.com")
+        start, days = GarminDbIngest(settings).download_plan(today=dt.date(2026, 6, 15))["sleep"]
+        assert start + dt.timedelta(days=days - 1) == dt.date(2026, 6, 15)
+
+    def test_the_plan_reads_the_shared_stat_table(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """STAT_TABLES binds each statistic to the table both the plan and the
+        coverage report measure. A private copy here could quietly drift from it."""
+        settings = Settings(app_data_dir=tmp_path / "appdata")
+        ensure_config(settings, user="rider@example.com")
+        monkeypatch.setattr(
+            ingest_module,
+            "STAT_TABLES",
+            {k: v for k, v in ingest_module.STAT_TABLES.items() if k != "hrv"},
+        )
+        plan = GarminDbIngest(settings).download_plan(today=dt.date(2026, 6, 15))
+        assert "hrv" not in plan
+        assert "sleep" in plan
 
     def test_covers_every_enabled_stat(self, tmp_path: Path) -> None:
         settings = Settings(app_data_dir=tmp_path / "appdata")
         ensure_config(settings, user="rider@example.com")
         plan = GarminDbIngest(settings).download_plan(today=dt.date(2026, 6, 15))
         assert set(plan) == {"monitoring", "sleep", "rhr", "hrv"}
+
+
+class TestPlanDate:
+    """The plan's "today" is the Garmin account's calendar date, never the container's.
+
+    The Dockerfile bootstraps TZ=UTC, and Garmin's calendarDate is local to the
+    account. A UTC date is wrong in both directions: a day ahead for a western
+    evening, a day behind for an eastern morning.
+    """
+
+    @staticmethod
+    def _ingest(tmp_path: Path, *, home_tz: str | None, now: dt.datetime) -> GarminDbIngest:
+        settings = Settings(app_data_dir=tmp_path / "appdata", home_tz=home_tz)
+        ensure_config(settings, user="rider@example.com")
+        return GarminDbIngest(settings, clock=lambda: now)
+
+    @staticmethod
+    def _last_day(ingest: GarminDbIngest) -> dt.date:
+        start, days = ingest.download_plan()["sleep"]
+        return start + dt.timedelta(days=days - 1)
+
+    def test_a_western_evening_is_still_today_locally(self, tmp_path: Path) -> None:
+        """03:00 UTC on the 16th is 20:00 on the 15th in Los Angeles. Planning
+        against the UTC date would ask Garmin for a calendarDate not yet begun."""
+        ingest = self._ingest(
+            tmp_path,
+            home_tz="America/Los_Angeles",
+            now=dt.datetime(2026, 6, 16, 3, 0, tzinfo=dt.UTC),
+        )
+        assert self._last_day(ingest) == dt.date(2026, 6, 15)
+
+    def test_an_eastern_morning_is_already_tomorrow_locally(self, tmp_path: Path) -> None:
+        """20:00 UTC on the 15th is 05:00 on the 16th in Tokyo. Planning against
+        the UTC date would miss the night that just ended for nine hours."""
+        ingest = self._ingest(
+            tmp_path, home_tz="Asia/Tokyo", now=dt.datetime(2026, 6, 15, 20, 0, tzinfo=dt.UTC)
+        )
+        assert self._last_day(ingest) == dt.date(2026, 6, 16)
+
+    def test_an_unknown_zone_plans_against_the_utc_date(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Only reachable before the first profile import has stored the zone.
+        This is a download range, not a timestamp conversion: at worst the edge day
+        lands one sync later, and this same sync imports the zone that fixes it."""
+        ingest = self._ingest(
+            tmp_path, home_tz=None, now=dt.datetime(2026, 6, 15, 20, 0, tzinfo=dt.UTC)
+        )
+        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.ingest"):
+            assert self._last_day(ingest) == dt.date(2026, 6, 15)
+        assert "timezone" in caplog.text.lower()
 
 
 class TestDownload:
@@ -198,7 +305,42 @@ class TestDownload:
     def test_fetches_every_enabled_stat(self, tmp_path: Path) -> None:
         log: list[str] = []
         make_ingest(tmp_path, log=log).download(Event())
-        assert log == ["login", "daily_summaries", "hydration", "monitoring", "sleep", "rhr", "hrv"]
+        # Monitoring is fetched a day per call, so it repeats; the order does not.
+        assert list(dict.fromkeys(log)) == [
+            "login",
+            "daily_summaries",
+            "hydration",
+            "monitoring",
+            "sleep",
+            "rhr",
+            "hrv",
+        ]
+
+    def test_monitoring_is_fetched_one_day_per_call(self, tmp_path: Path) -> None:
+        """GarminDB keeps only the *last* day's temp directory on
+        download.temp_dir. Asking for one day at a time is what makes each call's
+        directory the exact one to remove."""
+        calls: list[tuple[str, dt.date, int]] = []
+        ingest = make_ingest(tmp_path, log=[], calls=calls)
+        ingest.download_plan = lambda **_: {"monitoring": (dt.date(2026, 6, 13), 3)}  # type: ignore[method-assign]
+        ingest.download(Event())
+        assert [c for c in calls if c[0] == "monitoring"] == [
+            ("monitoring", dt.date(2026, 6, 13), 1),
+            ("monitoring", dt.date(2026, 6, 14), 1),
+            ("monitoring", dt.date(2026, 6, 15), 1),
+        ]
+
+    def test_monitoring_temp_directories_do_not_accumulate(self, tmp_path: Path) -> None:
+        """Download.get_monitoring makes a tempfile.mkdtemp() per day, leaves that
+        day's wellness zip in it, and never removes it. Every sync re-fetches the
+        recent days, so a long-lived container's /tmp grows without bound -- and
+        faster the more often the sync runs."""
+        created: list[str] = []
+        ingest = make_ingest(tmp_path, log=[], temp_dirs=created)
+        ingest.download_plan = lambda **_: {"monitoring": (dt.date(2026, 6, 13), 3)}  # type: ignore[method-assign]
+        ingest.download(Event())
+        assert len(created) == 3
+        assert [d for d in created if Path(d).exists()] == []
 
     def test_a_failed_login_stops_the_sync_loudly(self, tmp_path: Path) -> None:
         """Download.login() returns False rather than raising; left unchecked the

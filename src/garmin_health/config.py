@@ -11,7 +11,10 @@ import attrs
 import dateutil.parser
 
 DEFAULT_APP_DATA_DIR = Path("data")
-DEFAULT_SYNC_INTERVAL_SECONDS = 6 * 60 * 60
+# Freshness is capped by how often the watch syncs to Garmin Connect through the
+# phone, so much shorter buys little; six hours left last night's sleep missing
+# for most of a morning. The owner can change it on /setup.
+DEFAULT_SYNC_INTERVAL_SECONDS = 60 * 60
 # Matches GarminDB's own example. Downloads run ~1 second per day per stat, so a
 # backfill from here is hours on first run; GARMIN_BACKFILL_START_DATE shortens it.
 DEFAULT_BACKFILL_START_DATE = "2019-12-31"
@@ -74,6 +77,16 @@ class Settings:
     def token_file(self) -> Path:
         """Must match GarminConnectConfigManager.get_token_store_file()."""
         return self.config_dir / "garmin_tokens.json"
+
+    @property
+    def sync_state_file(self) -> Path:
+        """When the last forward sync started.
+
+        Has to survive a restart: without it every deploy waits out a whole
+        interval before its first sync, and a crash-looping container would sign
+        in to Garmin on every restart.
+        """
+        return self.app_data_dir / "sync_state.json"
 
     @property
     def preferences_file(self) -> Path:
@@ -174,8 +187,9 @@ def settings_from_env(env: Mapping[str, str] | None = None) -> Settings:
     """Build Settings from ``env`` (defaults to ``os.environ``)."""
     env = os.environ if env is None else env
 
-    # Cloud in a Bottle renamed OPENHOST_* to BOTTLE_*, but deployed apps still
-    # export only the old name, so both are accepted with the new one winning.
+    # Cloud in a Bottle renamed OPENHOST_* to BOTTLE_*. Routers from 2026-08-27 on
+    # export both; older ones export only the old name. Both are accepted with the new
+    # one winning -- which is exactly why the image must never bake in a BOTTLE_ value.
     app_data_dir = (
         _path_from(env, "BOTTLE_APP_DATA_DIR", "OPENHOST_APP_DATA_DIR") or DEFAULT_APP_DATA_DIR
     )
