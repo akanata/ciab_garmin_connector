@@ -30,7 +30,7 @@ from garmin_health.config import Settings
 
 logger = logging.getLogger(__name__)
 
-# GarminDB knows eight statistics; ``garmin/ingest.py`` implements download
+# GarminDB knows eight statistics; ``providers/garmindb/ingest.py`` implements download
 # branches for these four. Offering the rest would be a checkbox that does
 # nothing, and Statistics.from_string would raise on anything not in its enum.
 DOWNLOADABLE_STATS: tuple[str, ...] = ("monitoring", "sleep", "rhr", "hrv")

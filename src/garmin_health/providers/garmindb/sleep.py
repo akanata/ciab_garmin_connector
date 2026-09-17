@@ -41,13 +41,13 @@ from health_data_service import SleepStage
 from health_data_service import SleepStages
 from sqlalchemy.orm import Session
 
-from garmin_health.garmin.connection import GarminConnection
-from garmin_health.garmin.heart_rate import heart_rate_stats
-from garmin_health.garmin.heart_rate import session_heart_rate
-from garmin_health.garmin.heart_rate import session_hrv
-from garmin_health.garmin.heart_rate import window_hrv_average
-from garmin_health.garmin.sampling import period_rows
-from garmin_health.garmin.vocabulary import stage_for_event
+from garmin_health.providers.garmindb.connection import GarminConnection
+from garmin_health.providers.garmindb.heart_rate import heart_rate_stats
+from garmin_health.providers.garmindb.heart_rate import session_heart_rate
+from garmin_health.providers.garmindb.heart_rate import session_hrv
+from garmin_health.providers.garmindb.heart_rate import window_hrv_average
+from garmin_health.providers.garmindb.sampling import period_rows
+from garmin_health.providers.garmindb.vocabulary import stage_for_event
 from garmin_health.timezones import TimeZonePolicy
 
 logger = logging.getLogger(__name__)

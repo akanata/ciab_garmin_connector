@@ -15,23 +15,23 @@ from health_data_service import SleepSession
 from health_data_service import SleepStage
 
 from garmin_health.config import Settings
-from garmin_health.garmin import sleep as sleep_module
-from garmin_health.garmin.connection import GarminConnection
-from garmin_health.garmin.sleep import build_sleep_sessions
-from garmin_health.garmin.vocabulary import reset_unknown_event_log
-from tests.fixtures import AWAKE
-from tests.fixtures import DEEP_SLEEP
-from tests.fixtures import HOME_TZ_NAME
-from tests.fixtures import HRV_ROWS
-from tests.fixtures import JSON_NON_REM_STAGES
-from tests.fixtures import LIGHT_SLEEP
-from tests.fixtures import REM_SLEEP
-from tests.fixtures import STAGES
-from tests.fixtures import Fixture
-from tests.fixtures import build_fixture
-from tests.fixtures import heart_rate_at
-from tests.fixtures import hrv_at
-from tests.fixtures import mean
+from garmin_health.providers.garmindb import sleep as sleep_module
+from garmin_health.providers.garmindb.connection import GarminConnection
+from garmin_health.providers.garmindb.sleep import build_sleep_sessions
+from garmin_health.providers.garmindb.vocabulary import reset_unknown_event_log
+from tests.providers.garmindb.fixtures import AWAKE
+from tests.providers.garmindb.fixtures import DEEP_SLEEP
+from tests.providers.garmindb.fixtures import HOME_TZ_NAME
+from tests.providers.garmindb.fixtures import HRV_ROWS
+from tests.providers.garmindb.fixtures import JSON_NON_REM_STAGES
+from tests.providers.garmindb.fixtures import LIGHT_SLEEP
+from tests.providers.garmindb.fixtures import REM_SLEEP
+from tests.providers.garmindb.fixtures import STAGES
+from tests.providers.garmindb.fixtures import Fixture
+from tests.providers.garmindb.fixtures import build_fixture
+from tests.providers.garmindb.fixtures import heart_rate_at
+from tests.providers.garmindb.fixtures import hrv_at
+from tests.providers.garmindb.fixtures import mean
 
 HOUR = dt.timedelta(hours=1)
 
@@ -172,7 +172,7 @@ class TestWindowResolution:
         window, and a synthesized one looks valid, merges into
         get_sleep_sessions_merged, and silently poisons downstream aggregates. A
         gap in the list is detectable; a plausible lie is not."""
-        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.sleep"):
+        with caplog.at_level(logging.WARNING, logger="garmin_health.providers.garmindb.sleep"):
             _, sessions = sessions_for(
                 corpus_settings,
                 nights=1,
@@ -251,7 +251,7 @@ class TestStages:
     def test_an_unknown_token_degrades_and_warns_once(
         self, corpus_settings: Settings, caplog: pytest.LogCaptureFixture
     ) -> None:
-        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.vocabulary"):
+        with caplog.at_level(logging.WARNING, logger="garmin_health.providers.garmindb.vocabulary"):
             _, sessions = sessions_for(corpus_settings, nights=1, stages=["banana"] * len(STAGES))
         assert sessions[0].stages is not None
         assert {s.value for s in sessions[0].stages.samples} == {SleepStage.UNKNOWN}
@@ -407,7 +407,7 @@ class TestDerivedScalars:
         """Over 100% is precisely the canary that total_sleep and the event-derived
         window disagree, i.e. the tz skew is still present. Log it, don't swallow
         it."""
-        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.sleep"):
+        with caplog.at_level(logging.WARNING, logger="garmin_health.providers.garmindb.sleep"):
             _, sessions = sessions_for(corpus_settings, nights=1, total_sleep=dt.time(12, 0))
         assert sessions[0].efficiency is not None
         assert sessions[0].efficiency.value == 100.0
@@ -496,7 +496,7 @@ class TestSessionScalars:
     ) -> None:
         """monitoring_hrv_* is FIT-only and hrv is JSON-only; neither is
         universally present."""
-        with caplog.at_level(logging.INFO, logger="garmin_health.garmin.sleep"):
+        with caplog.at_level(logging.INFO, logger="garmin_health.providers.garmindb.sleep"):
             _, sessions = sessions_for(corpus_settings, nights=1, hrv_status=True)
         assert sessions[0].average_hrv is not None
         assert sessions[0].average_hrv.value == 44.0

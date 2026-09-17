@@ -19,19 +19,19 @@ The current iteration covers heart rate (`specific_types.py`) and sleep
 run the underlying `uv run …` commands), the Garmin auth flow (`config.py`,
 `garmin_config.py`, `auth.py`, `routes/owner.py`, `app.py`), containerization
 (`Dockerfile`, `openhost.toml`), the timezone strategy (`timezones.py`,
-`garmin/timezone_probe.py`), and the sync engine (`sync.py`,
-`garmin/ingest.py`) with `POST /sync`, `GET /sync/status` and the interval loop.
-`tests/fixtures.py` builds a real GarminDB SQLite corpus in a tmpdir.
+`providers/garmindb/timezone_probe.py`), and the sync engine (`sync.py`,
+`providers/garmindb/ingest.py`) with `POST /sync`, `GET /sync/status` and the interval loop.
+`tests/providers/garmindb/fixtures.py` builds a real GarminDB SQLite corpus in a tmpdir.
 `requirements.txt` is gone; dependencies live in `pyproject.toml` and are pinned
 by `uv.lock`.
 
 **Landed — plan.md Part 4, the serving layer:** `serialization.py`,
 `registry.py`, `service.py`, `routes/service.py`, and
-`garmin/{connection,sampling,vocabulary,heart_rate,daily,sleep}.py`. `/api/v1/metrics`,
+`providers/garmindb/{connection,sampling,vocabulary,heart_rate,daily,sleep}.py`. `/api/v1/metrics`,
 `/api/v1/time-series` and `/api/v1/sleep-sessions` serve real data;
 `/api/v1/workouts` is an empty `{"data": []}` and `/api/v1/workouts/{id}` a 404,
 both deliberately.
-`resolve_policy()` is now called once at boot by `garmin/connection.py`, and
+`resolve_policy()` is now called once at boot by `providers/garmindb/connection.py`, and
 again on every `GarminConnection.reset()`.
 
 Four metrics are served: `heart_rate`, `hrv_rmssd`, `sleep_score`,
@@ -131,7 +131,7 @@ Dockerfile, and test harness.
   every import from it degrades to `Any`.
 - **Wire types are attrs + cattrs, not pydantic.** All emitted timestamps are
   timezone-aware UTC, serialized as ISO 8601.
-- **Isolation rule:** only the `garmin/` package may import `garmindb`,
+- **Isolation rule:** only the `providers/garmindb/` package may import `garmindb`,
   `idbutils`, `fitfile`, or `sqlalchemy`. Everything crossing that boundary is
   a `health_data_service` type or a stdlib type. GarminDB may be swapped later
   for the real Garmin API or a different unofficial API later; this must not
@@ -149,15 +149,18 @@ src/garmin_health/
   garmin_config.py  Renders/validates GarminConnectConfig.json.
   auth.py           Garmin login + MFA state machine.
   sync.py           download -> import -> analyze; the background loop.
-  garmin/           connection, sampling, vocabulary, heart_rate, sleep, daily.
+  providers/
+    garmindb/       connection, sampling, vocabulary, heart_rate, sleep, daily.
   routes/           service.py (/api/v1/*), owner.py (/setup, /sync, /health).
 tests/
-  fixtures.py       build_fixture() - a real GarminDB SQLite in a tmpdir.
+  providers/
+    garmindb/       fixtures.py (build_fixture() - a real GarminDB SQLite in a
+                    tmpdir), fakes.py, and every test needing either.
 ```
 
 Dependency direction is strictly
-`routes -> service -> registry -> garmin/* -> garmindb`, with `timezones.py`
-imported only by `garmin/*`.
+`routes -> service -> registry -> providers/garmindb/* -> garmindb`, with `timezones.py`
+imported only by `providers/garmindb/*`.
 
 ## Critical Guardrails & Gotchas
 
@@ -310,7 +313,7 @@ imported only by `garmin/*`.
 - **plan.md §4b's `selectable=(table.time_col, column)` does not work.**
   `DbObject._s_query` hands its `selectable` to `session.query()` as a *single*
   entity, and SQLAlchemy 2.0 raises `ArgumentError` on a tuple there.
-  `garmin/sampling.py`'s `period_rows`/`period_count` build the same query from
+  `providers/garmindb/sampling.py`'s `period_rows`/`period_count` build the same query from
   `DbObject`'s public `during`/`after`/`before` expressions instead — still no
   raw SQL, still lightweight `Row` tuples rather than ORM instances.
 - **`Analyze()` cannot be constructed until `attributes.measurement_system`
@@ -338,7 +341,7 @@ imported only by `garmin/*`.
 - An unknown statistic is **refused** from form input and **dropped** from the
   stored file. Passing one through reaches `Statistics.from_string` deep inside
   GarminDB, far from anything that could explain it.
-- `STAT_TABLES` in `garmin/ingest.py` is the single source of truth binding a
+- `STAT_TABLES` in `providers/garmindb/ingest.py` is the single source of truth binding a
   statistic to its table. `download_plan` and `stat_coverage` both read it, so
   the gap shown on the page is measured against the same table the downloader
   uses to pick its range. Keep it that way or the two will disagree.
@@ -369,7 +372,7 @@ imported only by `garmin/*`.
 **Sync.**
 
 - `sync.py` imports **no** `garmindb`: it drives an `Ingest` port that
-  `garmin/ingest.py` implements. That is what keeps the whole sequence testable
+  `providers/garmindb/ingest.py` implements. That is what keeps the whole sequence testable
   with no account and no network — keep it that way.
 - The phase order is not optional: the profile importers must precede anything
   reading `measurement_system`, and `analyze` runs last.

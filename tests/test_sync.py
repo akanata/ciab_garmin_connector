@@ -23,9 +23,9 @@ from garmin_health.sync import SyncEngine
 from garmin_health.sync import SyncPhase
 from garmin_health.sync import TableStat
 from garmin_health.sync import incremental_range
-from tests.fakes import FakeIngest
-from tests.fakes import RecordingFactory
-from tests.fakes import ReportingIngest
+from tests.providers.garmindb.fakes import FakeIngest
+from tests.providers.garmindb.fakes import RecordingFactory
+from tests.providers.garmindb.fakes import ReportingIngest
 
 TODAY = dt.date(2026, 6, 15)
 FLOOR = dt.date(2019, 12, 31)

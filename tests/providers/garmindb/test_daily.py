@@ -9,13 +9,13 @@ from pathlib import Path
 import pytest
 
 from garmin_health.config import Settings
-from garmin_health.garmin.connection import GarminConnection
-from garmin_health.garmin.daily import build_resting_heart_rate
-from garmin_health.garmin.daily import build_sleep_score
-from garmin_health.garmin.daily import has_resting_heart_rate
-from garmin_health.garmin.daily import has_sleep_score
-from tests.fixtures import HOME_TZ_NAME
-from tests.fixtures import build_fixture
+from garmin_health.providers.garmindb.connection import GarminConnection
+from garmin_health.providers.garmindb.daily import build_resting_heart_rate
+from garmin_health.providers.garmindb.daily import build_sleep_score
+from garmin_health.providers.garmindb.daily import has_resting_heart_rate
+from garmin_health.providers.garmindb.daily import has_sleep_score
+from tests.providers.garmindb.fixtures import HOME_TZ_NAME
+from tests.providers.garmindb.fixtures import build_fixture
 
 
 @pytest.fixture
@@ -85,7 +85,7 @@ class TestRestingHeartRate:
     ) -> None:
         build_fixture(corpus_settings.health_data_dir, nights=1, daily_summary_rhr=True)
         with GarminConnection(corpus_settings) as conn:
-            with caplog.at_level(logging.INFO, logger="garmin_health.garmin.daily"):
+            with caplog.at_level(logging.INFO, logger="garmin_health.providers.garmindb.daily"):
                 build_resting_heart_rate(conn, None, None, None)
         assert "daily_summary" in caplog.text
 

@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session
 from garmin_health.config import DEFAULT_LIMIT
 from garmin_health.config import MAX_LIMIT
 from garmin_health.config import MAX_ROWS_SCANNED
-from garmin_health.garmin.connection import GarminConnection
+from garmin_health.providers.garmindb.connection import GarminConnection
 
 logger = logging.getLogger(__name__)
 

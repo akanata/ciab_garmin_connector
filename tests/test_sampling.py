@@ -15,19 +15,19 @@ from health_data_service import Sample
 from garmin_health.config import DEFAULT_LIMIT
 from garmin_health.config import MAX_LIMIT
 from garmin_health.config import Settings
-from garmin_health.garmin import sampling
-from garmin_health.garmin.connection import GarminConnection
-from garmin_health.garmin.sampling import InvalidLimit
-from garmin_health.garmin.sampling import WindowTooLarge
-from garmin_health.garmin.sampling import column_series
-from garmin_health.garmin.sampling import decimate
-from garmin_health.garmin.sampling import has_rows
-from garmin_health.garmin.sampling import resolve_limit
-from tests.fixtures import HEART_RATE_INTERVAL
-from tests.fixtures import HEART_RATE_ROWS
-from tests.fixtures import HOME_TZ_NAME
-from tests.fixtures import build_fixture
-from tests.fixtures import heart_rate_at
+from garmin_health.providers.garmindb import sampling
+from garmin_health.providers.garmindb.connection import GarminConnection
+from garmin_health.providers.garmindb.sampling import InvalidLimit
+from garmin_health.providers.garmindb.sampling import WindowTooLarge
+from garmin_health.providers.garmindb.sampling import column_series
+from garmin_health.providers.garmindb.sampling import decimate
+from garmin_health.providers.garmindb.sampling import has_rows
+from garmin_health.providers.garmindb.sampling import resolve_limit
+from tests.providers.garmindb.fixtures import HEART_RATE_INTERVAL
+from tests.providers.garmindb.fixtures import HEART_RATE_ROWS
+from tests.providers.garmindb.fixtures import HOME_TZ_NAME
+from tests.providers.garmindb.fixtures import build_fixture
+from tests.providers.garmindb.fixtures import heart_rate_at
 
 
 @pytest.fixture

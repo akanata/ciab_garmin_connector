@@ -2,7 +2,7 @@
 
 This module deliberately imports no ``garmindb``: it drives an :class:`Ingest`
 port, so GarminDB can be swapped for the real Garmin API later, and so the whole
-sequence is testable with no account and no network. ``garmin/ingest.py`` is the
+sequence is testable with no account and no network. ``providers/garmindb/ingest.py`` is the
 adapter that actually calls GarminDB.
 
 Two GarminDB behaviours shape the design:

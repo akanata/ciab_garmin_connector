@@ -10,9 +10,9 @@ from garmindb.import_monitoring import RemSleepActivityLevels
 from garmindb.import_monitoring import SleepActivityLevels
 from health_data_service import SleepStage
 
-from garmin_health.garmin.vocabulary import known_events
-from garmin_health.garmin.vocabulary import reset_unknown_event_log
-from garmin_health.garmin.vocabulary import stage_for_event
+from garmin_health.providers.garmindb.vocabulary import known_events
+from garmin_health.providers.garmindb.vocabulary import reset_unknown_event_log
+from garmin_health.providers.garmindb.vocabulary import stage_for_event
 
 
 @pytest.fixture(autouse=True)
@@ -69,7 +69,7 @@ class TestUnknownTokens:
         assert stage_for_event("banana") is SleepStage.UNKNOWN
 
     def test_an_unmapped_token_warns(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.vocabulary"):
+        with caplog.at_level(logging.WARNING, logger="garmin_health.providers.garmindb.vocabulary"):
             stage_for_event("banana")
         assert "banana" in caplog.text
 
@@ -79,19 +79,19 @@ class TestUnknownTokens:
         """A night is hundreds of events. Warning per row would bury the signal in
         its own noise, and the point of the warning is to make new Garmin
         vocabulary visible."""
-        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.vocabulary"):
+        with caplog.at_level(logging.WARNING, logger="garmin_health.providers.garmindb.vocabulary"):
             for _ in range(50):
                 stage_for_event("banana")
         assert len(caplog.records) == 1
 
     def test_a_second_distinct_token_warns_again(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.vocabulary"):
+        with caplog.at_level(logging.WARNING, logger="garmin_health.providers.garmindb.vocabulary"):
             stage_for_event("banana")
             stage_for_event("kumquat")
         assert len(caplog.records) == 2
 
     def test_a_known_token_never_warns(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.vocabulary"):
+        with caplog.at_level(logging.WARNING, logger="garmin_health.providers.garmindb.vocabulary"):
             stage_for_event("deep_sleep")
         assert caplog.records == []
 
@@ -99,7 +99,7 @@ class TestUnknownTokens:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """sleep_events.event is nullable, so this is reachable from real data."""
-        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.vocabulary"):
+        with caplog.at_level(logging.WARNING, logger="garmin_health.providers.garmindb.vocabulary"):
             assert stage_for_event(None) is SleepStage.UNKNOWN
             assert stage_for_event(None) is SleepStage.UNKNOWN
         assert len(caplog.records) == 1
@@ -112,6 +112,6 @@ class TestNormalization:
     def test_normalizing_does_not_hide_a_genuinely_new_token(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.vocabulary"):
+        with caplog.at_level(logging.WARNING, logger="garmin_health.providers.garmindb.vocabulary"):
             assert stage_for_event("Micro_Nap") is SleepStage.UNKNOWN
         assert len(caplog.records) == 1

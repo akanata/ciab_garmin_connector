@@ -19,10 +19,10 @@ from litestar.testing import TestClient
 from garmin_health.app import create_app
 from garmin_health.auth import GarminAuthenticator
 from garmin_health.config import Settings
-from tests.fakes import RecordingFactory
-from tests.fixtures import HOME_TZ_NAME
-from tests.fixtures import Fixture
-from tests.fixtures import build_fixture
+from tests.providers.garmindb.fakes import RecordingFactory
+from tests.providers.garmindb.fixtures import HOME_TZ_NAME
+from tests.providers.garmindb.fixtures import Fixture
+from tests.providers.garmindb.fixtures import build_fixture
 
 OWNER = {"X-OpenHost-Is-Owner": "true"}
 
@@ -176,7 +176,7 @@ class TestTimeSeries:
     def test_an_over_large_window_is_413(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("garmin_health.garmin.sampling.MAX_ROWS_SCANNED", 5)
+        monkeypatch.setattr("garmin_health.providers.garmindb.sampling.MAX_ROWS_SCANNED", 5)
         response = client.get("/api/v1/time-series", params={"metric": "heart_rate"})
         assert response.status_code == 413
 

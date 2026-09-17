@@ -67,7 +67,7 @@ def _warn_once(token: str) -> None:
         _warned.add(token)
     logger.warning(
         "Unmapped Garmin sleep event %r; reporting it as UNKNOWN. Garmin has probably added a "
-        "sleep level -- add it to garmin_health.garmin.vocabulary.",
+        "sleep level -- add it to garmin_health.providers.garmindb.vocabulary.",
         token,
     )
 

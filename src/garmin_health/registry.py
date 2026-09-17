@@ -1,7 +1,7 @@
 """``METRICS``: what ``/v1/metrics`` advertises and ``/v1/time-series`` serves.
 
 One declarative block per metric. Every builder comes from the generic factory in
-``garmin/sampling.py``, so an entry is data rather than code, and the descriptor is
+``providers/garmindb/sampling.py``, so an entry is data rather than code, and the descriptor is
 derived from the spec class itself rather than restated -- a descriptor advertising
 ``bpm`` for a series that emits ``ms`` would be a silent unit error in a merged
 cross-provider list.
@@ -39,10 +39,10 @@ from health_data_service import Sample
 from health_data_service import SleepScore
 from health_data_service import TimeSeries
 
-from garmin_health.garmin import daily
-from garmin_health.garmin import heart_rate as hr
-from garmin_health.garmin.sampling import Builder
-from garmin_health.garmin.sampling import Probe
+from garmin_health.providers.garmindb import daily
+from garmin_health.providers.garmindb import heart_rate as hr
+from garmin_health.providers.garmindb.sampling import Builder
+from garmin_health.providers.garmindb.sampling import Probe
 
 SOURCE = "garmin"
 

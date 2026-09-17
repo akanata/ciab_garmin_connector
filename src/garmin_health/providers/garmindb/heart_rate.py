@@ -19,10 +19,10 @@ from health_data_service import Sample
 from sqlalchemy.orm import Session
 
 from garmin_health.config import MAX_SESSION_SUBSERIES
-from garmin_health.garmin.sampling import column_series
-from garmin_health.garmin.sampling import decimate
-from garmin_health.garmin.sampling import has_rows
-from garmin_health.garmin.sampling import period_rows
+from garmin_health.providers.garmindb.sampling import column_series
+from garmin_health.providers.garmindb.sampling import decimate
+from garmin_health.providers.garmindb.sampling import has_rows
+from garmin_health.providers.garmindb.sampling import period_rows
 from garmin_health.timezones import TimeZonePolicy
 
 logger = logging.getLogger(__name__)

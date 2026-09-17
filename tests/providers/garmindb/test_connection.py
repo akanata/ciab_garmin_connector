@@ -16,13 +16,13 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from garmin_health.config import Settings
-from garmin_health.garmin.connection import GarminConnection
-from garmin_health.garmin.connection import GarminSchemaMismatch
-from garmin_health.garmin.connection import GarminUnavailable
+from garmin_health.providers.garmindb.connection import GarminConnection
+from garmin_health.providers.garmindb.connection import GarminSchemaMismatch
+from garmin_health.providers.garmindb.connection import GarminUnavailable
 from garmin_health.timezones import TimeZoneUnresolved
-from tests.fixtures import HOME_TZ_NAME
-from tests.fixtures import Fixture
-from tests.fixtures import build_fixture
+from tests.providers.garmindb.fixtures import HOME_TZ_NAME
+from tests.providers.garmindb.fixtures import Fixture
+from tests.providers.garmindb.fixtures import build_fixture
 
 
 @pytest.fixture

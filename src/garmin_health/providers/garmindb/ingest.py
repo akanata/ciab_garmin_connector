@@ -45,13 +45,13 @@ from garmindb.garmindb import Sleep
 from garmindb.garmindb import SleepEvents
 
 from garmin_health.config import Settings
-from garmin_health.garmin.timezone_probe import read_stored_time_zone
 from garmin_health.garmin_config import load_manager
 
 # TableStat is a plain value object on the port between sync.py and this adapter;
 # importing it here does not drag garmindb into sync.py, which is what keeps the
 # engine testable and GarminDB swappable.
 from garmin_health.preferences import STAT_LABELS
+from garmin_health.providers.garmindb.timezone_probe import read_stored_time_zone
 from garmin_health.sync import ProgressSink
 from garmin_health.sync import StatCoverage
 from garmin_health.sync import TableStat

@@ -17,14 +17,14 @@ import pytest
 from garmindb.garmindb import Attributes
 
 from garmin_health.config import Settings
-from garmin_health.garmin import ingest as ingest_module
-from garmin_health.garmin.ingest import Bindings
-from garmin_health.garmin.ingest import GarminDbIngest
 from garmin_health.garmin_config import ensure_config
 from garmin_health.preferences import DOWNLOADABLE_STATS
 from garmin_health.preferences import ImportPreferences
 from garmin_health.preferences import save_preferences
-from tests.fixtures import build_fixture
+from garmin_health.providers.garmindb import ingest as ingest_module
+from garmin_health.providers.garmindb.ingest import Bindings
+from garmin_health.providers.garmindb.ingest import GarminDbIngest
+from tests.providers.garmindb.fixtures import build_fixture
 
 
 class FakeStep:
@@ -291,7 +291,7 @@ class TestPlanDate:
         ingest = self._ingest(
             tmp_path, home_tz=None, now=dt.datetime(2026, 6, 15, 20, 0, tzinfo=dt.UTC)
         )
-        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.ingest"):
+        with caplog.at_level(logging.WARNING, logger="garmin_health.providers.garmindb.ingest"):
             assert self._last_day(ingest) == dt.date(2026, 6, 15)
         assert "timezone" in caplog.text.lower()
 
@@ -446,7 +446,7 @@ class TestAnalyze:
         layer reads, so skipping degrades nothing we serve; letting it raise would
         turn an otherwise complete sync into a reported failure."""
         log: list[str] = []
-        with caplog.at_level(logging.WARNING, logger="garmin_health.garmin.ingest"):
+        with caplog.at_level(logging.WARNING, logger="garmin_health.providers.garmindb.ingest"):
             make_ingest(tmp_path, log=log).analyze()
         assert log == []
         assert "measurement_system" in caplog.text

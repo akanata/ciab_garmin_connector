@@ -62,7 +62,7 @@ def _default_ingest_factory(settings: Settings) -> Callable[[], Ingest]:
     def build() -> Ingest:
         # Imported lazily so nothing touches the config directory until there is
         # actually a sync to run.
-        from garmin_health.garmin.ingest import GarminDbIngest  # noqa: PLC0415
+        from garmin_health.providers.garmindb.ingest import GarminDbIngest  # noqa: PLC0415
 
         return GarminDbIngest(settings)
 
@@ -108,7 +108,7 @@ def create_app(
         # Imported here rather than at module scope so the GarminDB import cost is
         # paid at startup rather than at import, which keeps `create_app` cheap for
         # anything that only wants to inspect the routes.
-        from garmin_health.garmin.connection import GarminConnection  # noqa: PLC0415
+        from garmin_health.providers.garmindb.connection import GarminConnection  # noqa: PLC0415
         from garmin_health.service import HealthDataService  # noqa: PLC0415
 
         connection = GarminConnection(settings)

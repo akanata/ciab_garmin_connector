@@ -10,13 +10,13 @@ import pytest
 from garmindb.garmindb import Attributes
 from garmindb.garmindb import MonitoringHeartRate
 
-from garmin_health.garmin.timezone_probe import read_offset_pairs
-from garmin_health.garmin.timezone_probe import read_stored_time_zone
-from garmin_health.garmin.timezone_probe import resolve_policy
+from garmin_health.providers.garmindb.timezone_probe import read_offset_pairs
+from garmin_health.providers.garmindb.timezone_probe import read_stored_time_zone
+from garmin_health.providers.garmindb.timezone_probe import resolve_policy
 from garmin_health.timezones import TimeZoneUnresolved
-from tests.fixtures import HOME_TZ
-from tests.fixtures import HOME_TZ_NAME
-from tests.fixtures import build_fixture
+from tests.providers.garmindb.fixtures import HOME_TZ
+from tests.providers.garmindb.fixtures import HOME_TZ_NAME
+from tests.providers.garmindb.fixtures import build_fixture
 
 UTC = dt.UTC
 

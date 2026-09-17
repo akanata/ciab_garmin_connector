@@ -9,7 +9,7 @@ from garmin_health.auth import GarminAuthenticator
 from garmin_health.auth import LinkState
 from garmin_health.config import Settings
 from garmin_health.garmin_config import config_user
-from tests.fakes import RecordingFactory
+from tests.providers.garmindb.fakes import RecordingFactory
 
 
 def make_auth(

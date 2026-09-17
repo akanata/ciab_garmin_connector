@@ -39,7 +39,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from garmin_health.config import Settings
-from garmin_health.garmin.timezone_probe import resolve_policy
+from garmin_health.providers.garmindb.timezone_probe import resolve_policy
 from garmin_health.timezones import TimeZonePolicy
 from garmin_health.timezones import TimeZoneUnresolved
 

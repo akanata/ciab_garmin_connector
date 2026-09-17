@@ -10,21 +10,21 @@ from health_data_service import HRV_RMSSD
 from health_data_service import HeartRate
 
 from garmin_health.config import Settings
-from garmin_health.garmin.connection import GarminConnection
-from garmin_health.garmin.heart_rate import build_heart_rate
-from garmin_health.garmin.heart_rate import build_hrv_rmssd
-from garmin_health.garmin.heart_rate import heart_rate_stats
-from garmin_health.garmin.heart_rate import session_heart_rate
-from garmin_health.garmin.heart_rate import session_hrv
-from garmin_health.garmin.heart_rate import window_hrv_average
-from tests.fixtures import HEART_RATE_ROWS
-from tests.fixtures import HOME_TZ_NAME
-from tests.fixtures import HRV_ROWS
-from tests.fixtures import Fixture
-from tests.fixtures import build_fixture
-from tests.fixtures import heart_rate_at
-from tests.fixtures import hrv_at
-from tests.fixtures import mean
+from garmin_health.providers.garmindb.connection import GarminConnection
+from garmin_health.providers.garmindb.heart_rate import build_heart_rate
+from garmin_health.providers.garmindb.heart_rate import build_hrv_rmssd
+from garmin_health.providers.garmindb.heart_rate import heart_rate_stats
+from garmin_health.providers.garmindb.heart_rate import session_heart_rate
+from garmin_health.providers.garmindb.heart_rate import session_hrv
+from garmin_health.providers.garmindb.heart_rate import window_hrv_average
+from tests.providers.garmindb.fixtures import HEART_RATE_ROWS
+from tests.providers.garmindb.fixtures import HOME_TZ_NAME
+from tests.providers.garmindb.fixtures import HRV_ROWS
+from tests.providers.garmindb.fixtures import Fixture
+from tests.providers.garmindb.fixtures import build_fixture
+from tests.providers.garmindb.fixtures import heart_rate_at
+from tests.providers.garmindb.fixtures import hrv_at
+from tests.providers.garmindb.fixtures import mean
 
 
 @pytest.fixture
@@ -127,7 +127,7 @@ class TestSessionSubSeries:
     ) -> None:
         """An 8-hour night is ~240 rows, so the cap only exists so one corrupt
         window cannot make a session unbounded."""
-        monkeypatch.setattr("garmin_health.garmin.heart_rate.MAX_SESSION_SUBSERIES", 20)
+        monkeypatch.setattr("garmin_health.providers.garmindb.heart_rate.MAX_SESSION_SUBSERIES", 20)
         with GarminConnection(corpus_settings) as conn:
             series = conn.read(
                 lambda g, m: session_heart_rate(

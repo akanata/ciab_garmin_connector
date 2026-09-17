@@ -28,10 +28,10 @@ from health_data_service import MetricType
 from health_data_service import SleepSession
 from health_data_service import TimeSeries
 
-from garmin_health.garmin.connection import GarminConnection
-from garmin_health.garmin.connection import GarminUnavailable
-from garmin_health.garmin.sampling import resolve_limit
-from garmin_health.garmin.sleep import build_sleep_sessions
+from garmin_health.providers.garmindb.connection import GarminConnection
+from garmin_health.providers.garmindb.connection import GarminUnavailable
+from garmin_health.providers.garmindb.sampling import resolve_limit
+from garmin_health.providers.garmindb.sleep import build_sleep_sessions
 from garmin_health.registry import METRICS
 from garmin_health.registry import MetricEntry
 from garmin_health.timezones import TimeZoneUnresolved

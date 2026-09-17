@@ -11,13 +11,13 @@ from health_data_service import HeartRate
 
 from garmin_health.config import DEFAULT_LIMIT
 from garmin_health.config import Settings
-from garmin_health.garmin.connection import GarminConnection
-from garmin_health.garmin.connection import GarminUnavailable
-from garmin_health.garmin.sampling import InvalidLimit
+from garmin_health.providers.garmindb.connection import GarminConnection
+from garmin_health.providers.garmindb.connection import GarminUnavailable
+from garmin_health.providers.garmindb.sampling import InvalidLimit
 from garmin_health.service import HealthDataService
 from garmin_health.service import UnknownMetric
-from tests.fixtures import HOME_TZ_NAME
-from tests.fixtures import build_fixture
+from tests.providers.garmindb.fixtures import HOME_TZ_NAME
+from tests.providers.garmindb.fixtures import build_fixture
 
 
 @pytest.fixture

@@ -23,8 +23,8 @@ from garmin_health.preferences import save_preferences
 from garmin_health.routes.owner import MINT_SNIPPET
 from garmin_health.routes.owner import _join_names
 from garmin_health.sync import TableStat
-from tests.fakes import FakeIngest
-from tests.fakes import RecordingFactory
+from tests.providers.garmindb.fakes import FakeIngest
+from tests.providers.garmindb.fakes import RecordingFactory
 
 OWNER = {"X-OpenHost-Is-Owner": "true"}
 

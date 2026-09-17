@@ -39,9 +39,9 @@ from litestar.status_codes import HTTP_404_NOT_FOUND
 from litestar.status_codes import HTTP_413_REQUEST_ENTITY_TOO_LARGE
 from litestar.status_codes import HTTP_503_SERVICE_UNAVAILABLE
 
-from garmin_health.garmin.connection import GarminUnavailable
-from garmin_health.garmin.sampling import InvalidLimit
-from garmin_health.garmin.sampling import WindowTooLarge
+from garmin_health.providers.garmindb.connection import GarminUnavailable
+from garmin_health.providers.garmindb.sampling import InvalidLimit
+from garmin_health.providers.garmindb.sampling import WindowTooLarge
 from garmin_health.serialization import metrics_payload
 from garmin_health.serialization import sleep_sessions_payload
 from garmin_health.serialization import time_series_payload
