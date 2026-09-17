@@ -35,8 +35,10 @@ both deliberately.
 again on every `GarminConnection.reset()`.
 
 Four metrics are served: `heart_rate`, `hrv_rmssd`, `sleep_score`,
-`readiness_resting_heart_rate`. `registry.py`'s docstring records which spec
-metrics are deliberately *not* served, and why — read it before adding one.
+`readiness_resting_heart_rate`. `providers/garmindb/registry.py`'s docstring
+records which spec metrics are deliberately *not* served, and why — read it
+before adding one. Its `metrics_for(conn)` binds each entry to the corpus, so the
+generic `registry.py` never names a `GarminConnection`.
 
 **Also landed alongside Part 4:** `POST /rebuild` (owner-only), which deletes the
 SQLite files and reimports the retained JSON/FIT corpus with `latest=False`. It
@@ -142,15 +144,20 @@ Dockerfile, and test harness.
 ```
 src/garmin_health/
   config.py         Settings (frozen attrs) from env. No I/O.
+  ports.py          HealthReader - what a provider hands the serving layer.
+  errors.py         ProviderUnavailable / ProviderNotReady. Both map to 503.
+  limits.py         resolve_limit, decimate, check_scan_cap. No provider content.
+  progress.py       SyncStep / ProgressSink - what a running acquisition reports.
   timezones.py      TimeZonePolicy - the ONLY place naive<->aware conversion happens.
   serialization.py  cattrs converter, hooks, the three response envelopes.
-  registry.py       METRICS: dict[str, MetricEntry]. Declarative; one block per metric.
+  registry.py       MetricEntry + metric_entry(). Declarative; no provider types.
   service.py        HealthDataService facade - the only thing routes/ imports.
   garmin_config.py  Renders/validates GarminConnectConfig.json.
   auth.py           Garmin login + MFA state machine.
   sync.py           download -> import -> analyze; the background loop.
   providers/
-    garmindb/       connection, sampling, vocabulary, heart_rate, sleep, daily.
+    garmindb/       connection, reader, registry, sampling, vocabulary,
+                    heart_rate, sleep, daily.
   routes/           service.py (/api/v1/*), owner.py (/setup, /sync, /health).
 tests/
   providers/
@@ -159,8 +166,14 @@ tests/
 ```
 
 Dependency direction is strictly
-`routes -> service -> registry -> providers/garmindb/* -> garmindb`, with `timezones.py`
-imported only by `providers/garmindb/*`.
+`routes -> service -> ports/registry/limits/errors -> health_data_service types`.
+**Nothing in that chain imports a provider.** The GarminDB reader is constructed
+in `app.py`'s lifespan and reaches `service.py` only as a `ports.HealthReader`;
+the ingest side reaches `sync.py` only as an `Ingest`. `timezones.py` is imported
+only by `providers/garmindb/*`. (`app.py`, `sync.py`, `auth.py`,
+`garmin_config.py` and `preferences.py` are still GarminDB-shaped and move under
+the provider in `provider_refactor.md` Phase 3-4; nothing enforces any of this
+until Phase 5.)
 
 ## Critical Guardrails & Gotchas
 

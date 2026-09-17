@@ -39,6 +39,8 @@ import attrs
 from garmin_health.auth import GarminAuthenticator
 from garmin_health.auth import LinkState
 from garmin_health.config import Settings
+from garmin_health.progress import ProgressSink
+from garmin_health.progress import SyncStep
 
 logger = logging.getLogger(__name__)
 
@@ -78,14 +80,6 @@ class TableStat:
 
     def as_dict(self) -> dict[str, Any]:
         return {"rows": self.rows, "latest": self.latest}
-
-
-ProgressSink = Callable[[str, int, int], None]
-"""``(what is happening now, steps finished, steps total)``. ``total`` 0 = unknown."""
-
-
-def _no_progress(label: str, done: int, total: int) -> None:
-    """Default sink, so the port can be driven without an engine attached."""
 
 
 @attrs.frozen
@@ -134,18 +128,6 @@ class StatCoverage:
             "floor": self.floor,
             "missing_days": self.missing_days,
         }
-
-
-@attrs.frozen
-class SyncStep:
-    """What the worker thread is doing right now."""
-
-    label: str
-    done: int = 0
-    total: int = 0
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"label": self.label, "done": self.done, "total": self.total}
 
 
 class Ingest(Protocol):

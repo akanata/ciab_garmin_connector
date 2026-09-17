@@ -39,15 +39,14 @@ from litestar.status_codes import HTTP_404_NOT_FOUND
 from litestar.status_codes import HTTP_413_REQUEST_ENTITY_TOO_LARGE
 from litestar.status_codes import HTTP_503_SERVICE_UNAVAILABLE
 
-from garmin_health.providers.garmindb.connection import GarminUnavailable
-from garmin_health.providers.garmindb.sampling import InvalidLimit
-from garmin_health.providers.garmindb.sampling import WindowTooLarge
+from garmin_health.errors import ProviderUnavailable
+from garmin_health.limits import InvalidLimit
+from garmin_health.limits import WindowTooLarge
 from garmin_health.serialization import metrics_payload
 from garmin_health.serialization import sleep_sessions_payload
 from garmin_health.serialization import time_series_payload
 from garmin_health.service import HealthDataService
 from garmin_health.service import UnknownMetric
-from garmin_health.timezones import TimeZoneUnresolved
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +70,7 @@ class BadRequest(Exception):
 def _service(state: State) -> HealthDataService:
     service: HealthDataService | None = state.get("health_service")
     if service is None:  # pragma: no cover - only if the lifespan never ran
-        raise GarminUnavailable("The serving layer is not initialised yet.")
+        raise ProviderUnavailable("The serving layer is not initialised yet.")
     return service
 
 
@@ -171,7 +170,8 @@ v1_router = Router(
         WindowTooLarge: _problem(HTTP_413_REQUEST_ENTITY_TOO_LARGE),
         InvalidLimit: _problem(HTTP_400_BAD_REQUEST),
         BadRequest: _problem(HTTP_400_BAD_REQUEST),
-        GarminUnavailable: _problem(HTTP_503_SERVICE_UNAVAILABLE),
-        TimeZoneUnresolved: _problem(HTTP_503_SERVICE_UNAVAILABLE),
+        # One entry covers every provider failure, including the not-ready case:
+        # both a stale corpus and an unresolvable timezone are ProviderUnavailable.
+        ProviderUnavailable: _problem(HTTP_503_SERVICE_UNAVAILABLE),
     },
 )

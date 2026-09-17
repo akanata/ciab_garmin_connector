@@ -179,7 +179,7 @@ class TestConsumerRoundTrip:
         assert sample.value == SleepStage.DEEP
 
     def test_the_consumers_sample_hook_drops_end_timestamp_on_a_bare_time_series(self) -> None:
-        """This is why an interval-valued metric must never appear in METRICS.
+        """This is why an interval-valued metric must never appear in a catalog.
 
         TimeSeries.samples is declared as bare list[Sample], and the client
         registers a structure hook for Sample that resolves by MRO -- so it fires

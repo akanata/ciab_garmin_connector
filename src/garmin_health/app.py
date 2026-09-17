@@ -80,17 +80,18 @@ def create_app(
     state = State({"settings": settings, "authenticator": authenticator})
 
     def on_corpus_changed() -> None:
-        """Called after every sync, on the sync's own worker thread.
+        """Called after every sync, on the event loop.
 
         Cheap (two ``engine.dispose()`` calls and two DB constructions) and the
         only thing that makes a rebuilt corpus, or a timezone that arrived with the
         first profile import, visible to the serving layer.
         """
+        reader = state.get("health_reader")
+        if reader is not None:
+            reader.reset()
         service = state.get("health_service")
-        if service is None:
-            return
-        service.connection.reset()
-        service.invalidate()
+        if service is not None:
+            service.invalidate()
 
     engine = SyncEngine(
         settings=settings,
@@ -109,17 +110,20 @@ def create_app(
         # paid at startup rather than at import, which keeps `create_app` cheap for
         # anything that only wants to inspect the routes.
         from garmin_health.providers.garmindb.connection import GarminConnection  # noqa: PLC0415
+        from garmin_health.providers.garmindb.reader import GarminDbReader  # noqa: PLC0415
         from garmin_health.service import HealthDataService  # noqa: PLC0415
 
-        connection = GarminConnection(settings)
-        state["health_service"] = HealthDataService(connection)
-        if connection.fault is not None:
-            logger.error("Serving layer degraded: %s", connection.fault)
+        reader = GarminDbReader(GarminConnection(settings))
+        state["health_reader"] = reader
+        state["health_service"] = HealthDataService(reader)
+        if reader.fault is not None:
+            logger.error("Serving layer degraded: %s", reader.fault)
         try:
             yield
         finally:
             state.pop("health_service", None)
-            connection.close()
+            state.pop("health_reader", None)
+            reader.close()
 
     @asynccontextmanager
     async def sync_loop(_: Litestar) -> AsyncGenerator[None, None]:

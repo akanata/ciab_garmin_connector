@@ -48,9 +48,9 @@ from garmin_health.preferences import load_preferences
 from garmin_health.preferences import parse_preferences
 from garmin_health.preferences import save_preferences
 from garmin_health.preferences import sync_interval_label
+from garmin_health.progress import SyncStep
 from garmin_health.sync import StatCoverage
 from garmin_health.sync import SyncEngine
-from garmin_health.sync import SyncStep
 
 PASSWORD_NOTICE = (
     "Garmin does not offer a consent-based API outside its developer portal, so linking "
@@ -146,7 +146,7 @@ def _serving_fault(state: State) -> str | None:
     service = state.get("health_service")
     if service is None:
         return None
-    fault: str | None = service.connection.fault
+    fault: str | None = service.fault
     return fault
 
 
