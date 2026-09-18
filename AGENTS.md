@@ -92,8 +92,10 @@ its own half of `/setup`; `app.py` holds it only as a `Provider`. The seam is
 proved by a test-only `FakeProvider` and by `tests/providers/test_contract.py`,
 which runs one contract against both it and the real GarminDB provider, so the
 double cannot drift into being easier to satisfy than the thing it stands for.
-Phases 5–6 (the `TID251` ban, `test_boundary.py`, the `warn_once` registry) are
-still outstanding — **nothing mechanically enforces the boundary yet.**
+**The boundary is now enforced**, not merely observed: `TID251` bans the vendor
+libraries and the concrete-provider import at lint time, and `tests/test_boundary.py`
+walks the import graph for the half a lint rule cannot state. Phase 6 (the
+`warn_once` registry, deduping `SOURCE`) is the only part still outstanding.
 
 **Not built yet:** workouts, body battery (`daily_summary.bb_*`, available but
 with no spec type — it would go under vendor-extension metric ids), and any
@@ -165,7 +167,12 @@ Dockerfile, and test harness.
   why the owner page's shell lives in `setup_page.py` and not under `routes/`:
   a provider has to import it to re-render the page when its own form fails.
   GarminDB may be swapped for the real Garmin API or an aggregator later; this
-  must not impact the HTTP layer.
+  must not impact the HTTP layer. Enforced by `TID251` plus
+  `tests/test_boundary.py` — see "Dependency direction" below.
+- **`garminconnect` is a declared direct dependency**, pinned to `0.3.11`, because
+  `providers/garmindb/auth.py` imports it. It also arrives transitively through
+  GarminDb; relying on that would let a GarminDb bump silently move a library
+  whose exact contracts this code is written against.
 
 ## Project Structure
 
@@ -217,8 +224,13 @@ Note that the `Ingest` port is a testability seam *inside* the provider — it i
 what lets the whole sync sequence run with no account and no network. It is
 **not** the provider seam; `ports.Provider` is.
 
-Nothing mechanically enforces any of this yet: the `TID251` banned-import table
-and `tests/test_boundary.py` are `provider_refactor.md` Phase 5.
+Two mechanisms enforce this, and they cross-check each other. `TID251` in
+`pyproject.toml` bans the vendor libraries and `garmin_health.providers.garmindb`
+outside their exemptions — fast, but a lint config is one deletion away from
+being gone. `tests/test_boundary.py` walks the import graph with `ast`, catches
+lazy imports inside functions, states the reverse rule that a global banned-api
+table cannot, and asserts the two agree. Adding an import that crosses the
+boundary should fail `ruff check` before it ever reaches a test.
 
 ## Critical Guardrails & Gotchas
 

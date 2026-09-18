@@ -232,6 +232,7 @@ source = { editable = "." }
 dependencies = [
     { name = "attrs" },
     { name = "cattrs" },
+    { name = "garminconnect" },
     { name = "garmindb" },
     { name = "health-data-service" },
     { name = "hypercorn" },
@@ -251,6 +252,7 @@ dev = [
 requires-dist = [
     { name = "attrs", specifier = ">=24.1" },
     { name = "cattrs", specifier = ">=24.1" },
+    { name = "garminconnect", specifier = "==0.3.11" },
     { name = "garmindb", specifier = "==3.9.0" },
     { name = "health-data-service", git = "https://github.com/cloud-in-a-bottle/health-data-service-spec?rev=main" },
     { name = "hypercorn", specifier = ">=0.18" },

@@ -58,6 +58,8 @@ The spec's client hardcodes `SERVICE_URL = "github.com/imbue-openhost/health-dat
 
 ## Repository layout
 
+> **Superseded by Addendum A** (end of this file). The layout below is the original design; `garmin/` is now `providers/garmindb/`, the boundary is a set of ports in `ports.py`, and the isolation rule is mechanically enforced. The *reasoning* below still holds — Addendum A records what changed and why.
+
 The rule that keeps this maintainable: **`garmin/` is the only package that may import `garmindb`, `idbutils`, `fitfile`, or `sqlalchemy`.** Everything crossing that boundary is a `health_data_service` type or a stdlib type. That is what lets GarminDB be swapped for the real Garmin API later without touching the HTTP layer.
 
 ```
@@ -616,3 +618,75 @@ The current `.venv` is Python **3.14**; the target is 3.12 to match the sibling 
 4. **Against the real client** — point `openhost_spec_mcp` at this app via its `consumes` entry and confirm `HealthDataClient.get_sleep_sessions()` and `.get_time_series()` deserialize without error. This is the acceptance test that matters.
 5. **Containerized** — the `openhost[test-harness]` `OpenhostStack` fixture (see `openhost_spec_mcp/tests/conftest.py`) builds the Dockerfile under podman behind the real router. Confirms `/v1/` is reachable through the service proxy and `/setup` is owner-gated.
 6. **Live sync** — link a real Garmin account through `/setup`, watch `/sync/status` row counts climb, re-run step 3 against real data, and spot-check one night's sleep session against the Garmin Connect app. Specifically check that `efficiency` is not clamped and that session `start` matches local bedtime — that pair is the end-to-end proof the timezone strategy holds.
+
+---
+
+## Addendum A — The provider boundary (2026-09)
+
+Parts 1–8 describe a single-provider app: GarminDB, scraped on a schedule. This addendum records what changed when that assumption was removed. It supersedes **Repository layout**; the rest of the plan still stands.
+
+### Why
+
+Terra, ROOK and Spike all offer free Garmin access, and all three deliver it by **webhook** rather than polling. Triaging the existing seam found the read path well isolated and the write path not isolated at all: `Settings` carried GarminDB's disk layout and polling knobs, `registry.py` and `service.py` were typed against `GarminConnection`, the HTTP exception classes lived inside the provider package, and roughly 60% of `routes/owner.py` was Garmin's. Nothing enforced the isolation rule the docs already claimed.
+
+### What the aggregators actually do (verified from their docs)
+
+- **Terra** — hosted widget/OAuth to link; webhooks *carry normalised data* in Terra's own schema; HMAC `terra-signature`; must 2xx within 8 s, so accept and process asynchronously. Historical data is a REST request whose results also arrive by webhook.
+- **Spike** — hosted redirect to link; webhooks are *notifications only* (`record_change`, `X-Body-Signature`) and the app must then fetch. Backfill after linking is automatic, announced by webhook.
+- **ROOK** — OAuth authorizer URL; data pulled by date; webhooks notify.
+
+**"Polling vs. webhook" is therefore the wrong axis.** What all four have in common is *provider-owned acquisition* — a timer, a signed payload, or notify-then-fetch — writing to a *provider-owned store*, read by a *provider-owned reader* that yields spec types. None of the GarminDB readers, the SQLite corpus or the timezone machinery would be reused by any aggregator. The ports are shaped around that, not around how often anything runs.
+
+`source` stays `"garmin"` for every provider: it names the device the data came off, not the route it took to get here.
+
+### Decisions
+
+1. **One app, provider chosen by config.** Both providers live under `providers/`, selected by `HEALTH_PROVIDER` (default `garmindb`). Same app name, URL, app data and metric ids.
+2. **An honest boundary plus enforcement, with no second real provider** until one is wanted. The seam is proved instead by a test-only `FakeProvider` and a contract test run against both it and the real provider.
+3. **`garmin/` → `providers/garmindb/`**, as its own mechanical commit.
+
+### The ports (`ports.py`)
+
+```python
+SOURCE = "garmin"
+
+class LinkState(StrEnum):        # PENDING, not AWAITING_MFA: an aggregator
+    NOT_LINKED; PENDING; LINKED; NEEDS_REAUTH   # links by redirect, not MFA
+
+LinkStatus(state, account, detail)   # detail derived from state ALONE
+SetupView(link, error, serving_fault, provider_error, today)
+
+class HealthReader(Protocol):    # fault, metrics, has_any_data,
+    ...                          # sleep_sessions, close
+
+class AccountLink(Protocol):     # status, peek_error, take_error, unlink
+
+class Provider(Protocol):
+    name; display_name; link
+    open_reader() -> HealthReader          # called once, by the app's lifespan
+    lifespans() -> list[Lifespan]          # garmindb: the sync loop
+    owner_routes() / public_routes()       # mounted by the app, gated or not
+    async status() -> dict                 # MUST carry running + progress
+    async render_setup(view) -> str        # its half of /setup
+    subscribe_data_changed(callback)
+```
+
+`MetricEntry.build`/`.probe` are **bound** — no connection argument — which is what lets `registry.py` stay free of any provider's types.
+
+### Layout
+
+`app.py` wires; `providers/build_provider()` is the only place a concrete provider is named; `GarminDbProvider` owns the engine, the authenticator, the connection and its own half of the owner page. The page's generic shell is `setup_page.py`, deliberately *not* under `routes/`, because a provider re-renders the whole page when one of its own forms fails validation and a provider may not import `routes.*`.
+
+Dependency direction: `routes → service → ports/registry/limits/errors → spec types`, and `app → providers → providers/garmindb`.
+
+### Enforcement
+
+`TID251` in `pyproject.toml` bans `garmindb`, `garminconnect`, `idbutils`, `fitfile`, `sqlalchemy`, `garth` and the string `garmin_health.providers.garmindb`, with `per-file-ignores` exempting the provider package, the selector and `tests/providers/`. A global banned-api table cannot express the *reverse* rule, so `tests/test_boundary.py` walks the import graph with `ast` — catching lazy imports inside functions — asserts that nothing under `providers/` imports the app layer, and cross-checks the ruff table so the two cannot drift.
+
+### Deliberate wire changes
+
+`/setup/status` reports `state: "pending"` rather than `"awaiting_mfa"`, and the account field is `account` rather than `email`. `/sync/status` gained a provider-owned `corpus` block (`db_dir`, `timezone`, `timezone_error`) and `SyncEngine.status()` no longer reports `link_state`, which now comes from the provider's `AccountLink` alone.
+
+### What a second provider should cost
+
+The falsifiable claim this whole exercise rests on: adding one is a new package under `providers/`, plus one string in `PROVIDER_NAMES`. It should touch **no existing source file**. If it turns out to need more, the boundary is still in the wrong place — and that is worth finding out cheaply.

@@ -20,6 +20,8 @@ from litestar import Litestar
 from litestar.datastructures import State
 from litestar.testing import TestClient
 
+from garmin_health.config import Settings
+from garmin_health.providers import build_provider
 from garmin_health.routes.service import v1_router
 from garmin_health.service import HealthDataService
 from tests.fakes import EPOCH
@@ -299,3 +301,23 @@ class TestManifestRoutingContract:
         """Only the path the router actually asks for is exposed. A second mount
         would be a public surface nothing uses and nothing tests against."""
         assert client.get("/v1/metrics").status_code == 404
+
+    def test_public_paths_matches_what_the_provider_serves_ungated(self, tmp_path: Path) -> None:
+        """Both directions, because both failures are silent.
+
+        A public route missing from ``public_paths`` is never forwarded to; a
+        ``public_paths`` entry nothing serves is a declared door onto a 404.
+
+        Vacuously true today -- every route is either the spec surface, reached
+        through the router's internal service proxy, or owner-gated. It becomes
+        load-bearing the moment a provider adds a webhook receiver, which is the
+        whole reason an aggregator would need one.
+
+        Asked of ``build_provider`` rather than a named provider, so this stays
+        true of whichever one the image ships.
+        """
+        manifest = tomllib.loads(MANIFEST.read_text())
+        declared = set(manifest["routing"]["public_paths"])
+        provider = build_provider(Settings(app_data_dir=tmp_path / "appdata"))
+        served = {path for handler in provider.public_routes() for path in handler.paths}
+        assert served == declared

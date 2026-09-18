@@ -12,6 +12,13 @@ health_check = "/health"
 # No public_paths. /setup stays behind the router's owner gate (and is guarded
 # in-app by X-OpenHost-Is-Owner as well), and /v1/* is reached through the
 # router's internal service proxy rather than as external browser traffic.
+#
+# This list and the active provider's public_routes() must match exactly, both
+# ways: a route missing from here is never forwarded to, and an entry nothing
+# serves is a declared door onto a 404. Both failures are silent, so
+# TestManifestRoutingContract asserts it. A webhook-based provider (Terra, ROOK,
+# Spike) would be the first thing to need an entry here -- its receiver is called
+# by the vendor, with no owner header anywhere.
 public_paths = []
 
 [resources]
