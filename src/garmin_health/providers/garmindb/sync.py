@@ -36,11 +36,11 @@ from typing import Protocol
 import anyio.to_thread
 import attrs
 
-from garmin_health.auth import GarminAuthenticator
-from garmin_health.auth import LinkState
-from garmin_health.config import Settings
 from garmin_health.progress import ProgressSink
 from garmin_health.progress import SyncStep
+from garmin_health.providers.garmindb.auth import GarminAuthenticator
+from garmin_health.providers.garmindb.auth import LinkState
+from garmin_health.providers.garmindb.settings import GarminDbSettings
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +226,7 @@ class SyncEngine:
     def __init__(
         self,
         *,
-        settings: Settings,
+        settings: GarminDbSettings,
         authenticator: GarminAuthenticator,
         ingest_factory: Callable[[], Ingest],
         clock: Callable[[], dt.datetime] = _utcnow,

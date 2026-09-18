@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from garminconnect import Garmin
@@ -11,22 +12,32 @@ from garminconnect import GarminConnectAuthenticationError
 from litestar.testing import TestClient
 
 from garmin_health.app import create_app
-from garmin_health.auth import GarminAuthenticator
-from garmin_health.config import Settings
-from garmin_health.garmin_config import read_config
-from garmin_health.preferences import DOWNLOADABLE_STATS
-from garmin_health.preferences import STAT_LABELS
-from garmin_health.preferences import SYNC_INTERVAL_CHOICES
-from garmin_health.preferences import ImportPreferences
-from garmin_health.preferences import load_preferences
-from garmin_health.preferences import save_preferences
+from garmin_health.providers.garmindb.auth import GarminAuthenticator
+from garmin_health.providers.garmindb.config_file import read_config
+from garmin_health.providers.garmindb.preferences import DOWNLOADABLE_STATS
+from garmin_health.providers.garmindb.preferences import STAT_LABELS
+from garmin_health.providers.garmindb.preferences import SYNC_INTERVAL_CHOICES
+from garmin_health.providers.garmindb.preferences import ImportPreferences
+from garmin_health.providers.garmindb.preferences import load_preferences
+from garmin_health.providers.garmindb.preferences import save_preferences
+from garmin_health.providers.garmindb.settings import GarminDbSettings
+from garmin_health.providers.garmindb.sync import TableStat
 from garmin_health.routes.owner import MINT_SNIPPET
 from garmin_health.routes.owner import _join_names
-from garmin_health.sync import TableStat
 from tests.providers.garmindb.fakes import FakeIngest
 from tests.providers.garmindb.fakes import RecordingFactory
 
 OWNER = {"X-OpenHost-Is-Owner": "true"}
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> GarminDbSettings:
+    """Overrides the generic fixture: every route exercised here is GarminDB's.
+
+    This whole module moves under ``tests/providers/garmindb/`` in Phase 4, when
+    the page splits into a generic shell and the provider's own fragments.
+    """
+    return GarminDbSettings(app_data_dir=tmp_path / "appdata")
 
 
 @pytest.fixture
@@ -35,9 +46,10 @@ def factory() -> RecordingFactory:
 
 
 @pytest.fixture
-def client(settings: Settings, factory: RecordingFactory) -> Iterator[TestClient]:
+def client(settings: GarminDbSettings, factory: RecordingFactory) -> Iterator[TestClient]:
     app = create_app(
-        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+        provider_settings=settings,
+        authenticator=GarminAuthenticator(settings, garmin_factory=factory),
     )
     with TestClient(app=app) as c:
         yield c
@@ -104,11 +116,12 @@ def test_credentials_post_links_the_account(client: TestClient) -> None:
 
 
 def test_mfa_flow_moves_through_awaiting_to_linked(
-    settings: Settings, factory: RecordingFactory
+    settings: GarminDbSettings, factory: RecordingFactory
 ) -> None:
     factory.client_kwargs["needs_mfa"] = True
     app = create_app(
-        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+        provider_settings=settings,
+        authenticator=GarminAuthenticator(settings, garmin_factory=factory),
     )
     with TestClient(app=app) as client:
         client.post(
@@ -124,11 +137,12 @@ def test_mfa_flow_moves_through_awaiting_to_linked(
 
 
 def test_bad_credentials_render_an_error_rather_than_a_500(
-    settings: Settings,
+    settings: GarminDbSettings,
 ) -> None:
     factory = RecordingFactory(login_error=GarminConnectAuthenticationError("bad password"))
     app = create_app(
-        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+        provider_settings=settings,
+        authenticator=GarminAuthenticator(settings, garmin_factory=factory),
     )
     with TestClient(app=app) as client:
         response = client.post(
@@ -169,12 +183,13 @@ def test_the_password_is_never_echoed_back_into_the_page(client: TestClient) -> 
     assert "hunter2" not in client.get("/setup", headers=OWNER).text
 
 
-def test_setup_page_escapes_the_email(settings: Settings) -> None:
+def test_setup_page_escapes_the_email(settings: GarminDbSettings) -> None:
     """The email is owner-supplied and lands in HTML; it must not be able to close
     an attribute and inject markup."""
     factory = RecordingFactory(needs_mfa=False)
     app = create_app(
-        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+        provider_settings=settings,
+        authenticator=GarminAuthenticator(settings, garmin_factory=factory),
     )
     with TestClient(app=app) as client:
         client.post(
@@ -185,12 +200,13 @@ def test_setup_page_escapes_the_email(settings: Settings) -> None:
         assert "<script>alert(1)</script>" not in client.get("/setup", headers=OWNER).text
 
 
-def test_a_failed_sign_in_message_does_not_survive_a_refresh(settings: Settings) -> None:
+def test_a_failed_sign_in_message_does_not_survive_a_refresh(settings: GarminDbSettings) -> None:
     """Regression: the failure was stored on the authenticator and re-rendered on
     every GET, so /setup kept reporting a sign-in failure indefinitely."""
     factory = RecordingFactory(login_error=GarminConnectAuthenticationError("bad password"))
     app = create_app(
-        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+        provider_settings=settings,
+        authenticator=GarminAuthenticator(settings, garmin_factory=factory),
     )
     with TestClient(app=app) as client:
         first = client.post(
@@ -206,10 +222,11 @@ def test_a_failed_sign_in_message_does_not_survive_a_refresh(settings: Settings)
         assert "class='error'" not in refreshed.text
 
 
-def test_a_failed_mfa_message_does_not_survive_a_refresh(settings: Settings) -> None:
+def test_a_failed_mfa_message_does_not_survive_a_refresh(settings: GarminDbSettings) -> None:
     factory = RecordingFactory(needs_mfa=True, mfa_code="654321")
     app = create_app(
-        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+        provider_settings=settings,
+        authenticator=GarminAuthenticator(settings, garmin_factory=factory),
     )
     with TestClient(app=app) as client:
         client.post(
@@ -224,10 +241,11 @@ def test_a_failed_mfa_message_does_not_survive_a_refresh(settings: Settings) -> 
         assert "not accepted" not in client.get("/setup", headers=OWNER).text.lower()
 
 
-def test_status_endpoint_reports_the_error_without_consuming_it(settings: Settings) -> None:
+def test_status_endpoint_reports_the_error_without_consuming_it(settings: GarminDbSettings) -> None:
     factory = RecordingFactory(login_error=GarminConnectAuthenticationError("bad password"))
     app = create_app(
-        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+        provider_settings=settings,
+        authenticator=GarminAuthenticator(settings, garmin_factory=factory),
     )
     with TestClient(app=app) as client:
         client.post(
@@ -242,11 +260,12 @@ def test_status_endpoint_reports_the_error_without_consuming_it(settings: Settin
         assert client.get("/setup/status", headers=OWNER).json()["error"] is None
 
 
-def test_the_awaiting_mfa_prompt_is_not_a_flash(settings: Settings) -> None:
+def test_the_awaiting_mfa_prompt_is_not_a_flash(settings: GarminDbSettings) -> None:
     """State-derived guidance must persist across refreshes, unlike an error."""
     factory = RecordingFactory(needs_mfa=True)
     app = create_app(
-        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+        provider_settings=settings,
+        authenticator=GarminAuthenticator(settings, garmin_factory=factory),
     )
     with TestClient(app=app) as client:
         client.post(
@@ -267,10 +286,11 @@ def test_sign_in_form_declares_an_in_flight_message(client: TestClient) -> None:
     assert "spinner" in page
 
 
-def test_mfa_form_declares_an_in_flight_message(settings: Settings) -> None:
+def test_mfa_form_declares_an_in_flight_message(settings: GarminDbSettings) -> None:
     factory = RecordingFactory(needs_mfa=True)
     app = create_app(
-        settings=settings, authenticator=GarminAuthenticator(settings, garmin_factory=factory)
+        provider_settings=settings,
+        authenticator=GarminAuthenticator(settings, garmin_factory=factory),
     )
     with TestClient(app=app) as client:
         client.post(
@@ -312,14 +332,14 @@ def wait_for_sync(client: TestClient, timeout: float = 5.0) -> dict:
 
 
 def linked_client(
-    settings: Settings, ingest: FakeIngest | None = None
+    settings: GarminDbSettings, ingest: FakeIngest | None = None
 ) -> tuple[TestClient, FakeIngest]:
     """A TestClient whose account is already linked, with a fake ingest behind it."""
     settings.config_dir.mkdir(parents=True, exist_ok=True)
     settings.token_file.write_text('{"di_refresh_token": "r"}')
     ingest = ingest or FakeIngest()
     app = create_app(
-        settings=settings,
+        provider_settings=settings,
         authenticator=GarminAuthenticator(
             settings, garmin_factory=RecordingFactory(needs_mfa=False)
         ),
@@ -330,12 +350,14 @@ def linked_client(
 
 class TestSyncEndpoints:
     @pytest.mark.parametrize(("method", "path"), [("POST", "/sync"), ("GET", "/sync/status")])
-    def test_sync_surface_is_owner_gated(self, settings: Settings, method: str, path: str) -> None:
+    def test_sync_surface_is_owner_gated(
+        self, settings: GarminDbSettings, method: str, path: str
+    ) -> None:
         client, _ = linked_client(settings)
         with client:
             assert client.request(method, path).status_code == 401
 
-    def test_status_reports_link_state_and_interval(self, settings: Settings) -> None:
+    def test_status_reports_link_state_and_interval(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             body = client.get("/sync/status", headers=OWNER).json()
@@ -344,7 +366,7 @@ class TestSyncEndpoints:
         assert body["last_sync"] is None
         assert body["interval_seconds"] > 0
 
-    def test_trigger_accepts_and_reports_that_it_started(self, settings: Settings) -> None:
+    def test_trigger_accepts_and_reports_that_it_started(self, settings: GarminDbSettings) -> None:
         client, ingest = linked_client(settings)
         with client:
             response = client.post("/sync", headers=OWNER)
@@ -353,11 +375,13 @@ class TestSyncEndpoints:
             assert wait_for_sync(client)["last_sync"] is not None
         assert ingest.calls.count("download") == 1
 
-    def test_trigger_is_refused_while_the_account_is_unlinked(self, settings: Settings) -> None:
+    def test_trigger_is_refused_while_the_account_is_unlinked(
+        self, settings: GarminDbSettings
+    ) -> None:
         """Syncing needs the saved token; silently doing nothing would look like a
         working sync that never produces data."""
         app = create_app(
-            settings=settings,
+            provider_settings=settings,
             authenticator=GarminAuthenticator(
                 settings, garmin_factory=RecordingFactory(needs_mfa=False)
             ),
@@ -368,7 +392,7 @@ class TestSyncEndpoints:
             assert response.status_code == 409
             assert "link" in response.json()["detail"].lower()
 
-    def test_status_surfaces_a_failed_sync(self, settings: Settings) -> None:
+    def test_status_surfaces_a_failed_sync(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings, FakeIngest(fail_on="download"))
         with client:
             client.post("/sync", headers=OWNER)
@@ -376,7 +400,7 @@ class TestSyncEndpoints:
         assert last["error"] is not None
         assert last["phase"] == "download"
 
-    def test_status_surfaces_a_sync_that_changed_nothing(self, settings: Settings) -> None:
+    def test_status_surfaces_a_sync_that_changed_nothing(self, settings: GarminDbSettings) -> None:
         """The signature of GarminDB's importers swallowing every per-file error."""
         same = {"sleep": TableStat(rows=2, latest="2026-06-14T23:00:00")}
         client, _ = linked_client(settings, FakeIngest(stats_sequence=[same, same]))
@@ -387,7 +411,7 @@ class TestSyncEndpoints:
         assert last["changed"] is False
         assert last["tables"]["sleep"]["rows"] == 2
 
-    def test_health_stays_ok_while_a_sync_is_failing(self, settings: Settings) -> None:
+    def test_health_stays_ok_while_a_sync_is_failing(self, settings: GarminDbSettings) -> None:
         """Failing the probe would make the router restart a container whose only
         problem is that Garmin is unreachable."""
         client, _ = linked_client(settings, FakeIngest(fail_on="download"))
@@ -397,14 +421,14 @@ class TestSyncEndpoints:
 
 
 class TestSetupShowsSyncState:
-    def test_setup_offers_a_sync_button_once_linked(self, settings: Settings) -> None:
+    def test_setup_offers_a_sync_button_once_linked(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             page = client.get("/setup", headers=OWNER).text
         assert "/sync" in page
         assert "sync" in page.lower()
 
-    def test_setup_reports_the_last_sync(self, settings: Settings) -> None:
+    def test_setup_reports_the_last_sync(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             client.post("/sync", headers=OWNER)
@@ -412,15 +436,15 @@ class TestSetupShowsSyncState:
             page = client.get("/setup", headers=OWNER).text
         assert "Last sync" in page
 
-    def test_setup_says_when_nothing_has_synced_yet(self, settings: Settings) -> None:
+    def test_setup_says_when_nothing_has_synced_yet(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             page = client.get("/setup", headers=OWNER).text
         assert "not synced yet" in page.lower()
 
-    def test_an_unlinked_setup_page_offers_no_sync_button(self, settings: Settings) -> None:
+    def test_an_unlinked_setup_page_offers_no_sync_button(self, settings: GarminDbSettings) -> None:
         app = create_app(
-            settings=settings,
+            provider_settings=settings,
             authenticator=GarminAuthenticator(
                 settings, garmin_factory=RecordingFactory(needs_mfa=False)
             ),
@@ -433,7 +457,7 @@ class TestSetupShowsSyncState:
 class TestImportScopeControls:
     """The owner sets how far back to go and which metrics to fetch, from the page."""
 
-    def test_the_form_is_rendered_with_the_current_scope(self, settings: Settings) -> None:
+    def test_the_form_is_rendered_with_the_current_scope(self, settings: GarminDbSettings) -> None:
         save_preferences(
             settings,
             ImportPreferences(
@@ -449,14 +473,14 @@ class TestImportScopeControls:
         assert "name='stats' value='hrv' checked" in page
         assert "name='stats' value='monitoring' checked" not in page
 
-    def test_every_downloadable_metric_gets_a_checkbox(self, settings: Settings) -> None:
+    def test_every_downloadable_metric_gets_a_checkbox(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             page = client.get("/setup", headers=OWNER).text
         for stat in DOWNLOADABLE_STATS:
             assert f"value='{stat}'" in page
 
-    def test_saving_the_scope_persists_it(self, settings: Settings) -> None:
+    def test_saving_the_scope_persists_it(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             response = client.post(
@@ -470,7 +494,7 @@ class TestImportScopeControls:
         assert saved.start_date == dt.date(2025, 2, 1)
         assert saved.enabled_stats == frozenset({"sleep", "rhr"})
 
-    def test_the_scope_reaches_the_garmindb_config(self, settings: Settings) -> None:
+    def test_the_scope_reaches_the_garmindb_config(self, settings: GarminDbSettings) -> None:
         """Saving has to change what the next sync actually downloads, not just
         what the page displays."""
         client, _ = linked_client(settings)
@@ -485,13 +509,13 @@ class TestImportScopeControls:
         assert raw["enabled_stats"]["sleep"] is True
         assert raw["enabled_stats"]["monitoring"] is False
 
-    def test_deselecting_everything_pauses_imports(self, settings: Settings) -> None:
+    def test_deselecting_everything_pauses_imports(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             client.post("/setup/import", data={"start_date": "2025-02-01"}, headers=OWNER)
         assert load_preferences(settings).enabled_stats == frozenset()
 
-    def test_the_page_says_so_when_nothing_is_selected(self, settings: Settings) -> None:
+    def test_the_page_says_so_when_nothing_is_selected(self, settings: GarminDbSettings) -> None:
         save_preferences(
             settings,
             ImportPreferences(start_date=dt.date(2024, 3, 1), enabled_stats=frozenset()),
@@ -501,7 +525,7 @@ class TestImportScopeControls:
             page = client.get("/setup", headers=OWNER).text
         assert "no metrics" in page.lower()
 
-    def test_a_bad_date_is_explained_and_nothing_is_saved(self, settings: Settings) -> None:
+    def test_a_bad_date_is_explained_and_nothing_is_saved(self, settings: GarminDbSettings) -> None:
         before = load_preferences(settings)
         client, _ = linked_client(settings)
         with client:
@@ -514,7 +538,7 @@ class TestImportScopeControls:
         assert "YYYY-MM-DD" in response.text
         assert load_preferences(settings) == before
 
-    def test_a_future_date_is_refused(self, settings: Settings) -> None:
+    def test_a_future_date_is_refused(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             response = client.post(
@@ -525,7 +549,7 @@ class TestImportScopeControls:
         assert response.status_code == 400
         assert "future" in response.text.lower()
 
-    def test_the_scope_form_is_owner_gated(self, settings: Settings) -> None:
+    def test_the_scope_form_is_owner_gated(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             assert (
@@ -534,7 +558,7 @@ class TestImportScopeControls:
 
 
 class TestCoverageDisplay:
-    def test_each_metric_reports_what_it_holds(self, settings: Settings) -> None:
+    def test_each_metric_reports_what_it_holds(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             page = client.get("/setup", headers=OWNER).text
@@ -543,7 +567,9 @@ class TestCoverageDisplay:
         for label in STAT_LABELS.values():
             assert label in page
 
-    def test_a_metric_short_of_the_floor_offers_a_backfill(self, settings: Settings) -> None:
+    def test_a_metric_short_of_the_floor_offers_a_backfill(
+        self, settings: GarminDbSettings
+    ) -> None:
         """The whole reason the date control is not a no-op: incremental downloads
         only ever move forward from the newest row."""
         client, _ = linked_client(settings)
@@ -552,13 +578,13 @@ class TestCoverageDisplay:
         assert "action='/backfill'" in page
         assert "1,521" in page
 
-    def test_a_complete_metric_offers_no_backfill(self, settings: Settings) -> None:
+    def test_a_complete_metric_offers_no_backfill(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings, FakeIngest(coverage_gap=False))
         with client:
             page = client.get("/setup", headers=OWNER).text
         assert "action='/backfill'" not in page
 
-    def test_coverage_is_exposed_as_json(self, settings: Settings) -> None:
+    def test_coverage_is_exposed_as_json(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             body = client.get("/sync/status", headers=OWNER).json()
@@ -568,7 +594,7 @@ class TestCoverageDisplay:
 
 
 class TestBackfillTrigger:
-    def test_it_starts_a_backfill(self, settings: Settings) -> None:
+    def test_it_starts_a_backfill(self, settings: GarminDbSettings) -> None:
         client, ingest = linked_client(settings)
         with client:
             response = client.post("/backfill", headers=OWNER)
@@ -577,10 +603,10 @@ class TestBackfillTrigger:
             wait_for_sync(client)
         assert "backfill" in ingest.calls
 
-    def test_it_is_refused_while_unlinked(self, settings: Settings) -> None:
+    def test_it_is_refused_while_unlinked(self, settings: GarminDbSettings) -> None:
         """It really does talk to Garmin, unlike a rebuild."""
         app = create_app(
-            settings=settings,
+            provider_settings=settings,
             authenticator=GarminAuthenticator(
                 settings, garmin_factory=RecordingFactory(needs_mfa=False)
             ),
@@ -589,14 +615,14 @@ class TestBackfillTrigger:
         with TestClient(app=app) as unlinked:
             assert unlinked.post("/backfill", headers=OWNER).status_code == 409
 
-    def test_it_is_owner_gated(self, settings: Settings) -> None:
+    def test_it_is_owner_gated(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             assert client.post("/backfill").status_code == 401
 
 
 class TestProgressDisplay:
-    def test_the_page_shows_the_step_a_running_sync_is_on(self, settings: Settings) -> None:
+    def test_the_page_shows_the_step_a_running_sync_is_on(self, settings: GarminDbSettings) -> None:
         gate = threading.Event()
         client, _ = linked_client(settings, FakeIngest(block_on=gate))
         try:
@@ -613,7 +639,9 @@ class TestProgressDisplay:
         finally:
             gate.set()
 
-    def test_the_status_endpoint_reports_no_progress_while_idle(self, settings: Settings) -> None:
+    def test_the_status_endpoint_reports_no_progress_while_idle(
+        self, settings: GarminDbSettings
+    ) -> None:
         client, _ = linked_client(settings)
         with client:
             assert client.get("/sync/status", headers=OWNER).json()["progress"] is None
@@ -622,7 +650,9 @@ class TestProgressDisplay:
 class TestCoverageWording:
     """The table is the only place the owner learns what is actually there."""
 
-    def test_a_metric_holding_nothing_is_not_called_complete(self, settings: Settings) -> None:
+    def test_a_metric_holding_nothing_is_not_called_complete(
+        self, settings: GarminDbSettings
+    ) -> None:
         """has_gap is False for an empty metric because a normal sync already
         starts it at the floor -- but "complete" would be a plain lie."""
         client, _ = linked_client(settings, FakeIngest(empty_metrics=True))
@@ -632,7 +662,7 @@ class TestCoverageWording:
         assert "starts at your date" in page
         assert "nothing yet" in page
 
-    def test_a_paused_metric_that_holds_data_says_paused(self, settings: Settings) -> None:
+    def test_a_paused_metric_that_holds_data_says_paused(self, settings: GarminDbSettings) -> None:
         """Switching a metric off does not delete what it already downloaded, and
         the row still has to say what is there."""
         client, _ = linked_client(settings, FakeIngest(disabled_metrics=True))
@@ -642,7 +672,9 @@ class TestCoverageWording:
         assert "42 rows" in page
         assert "action='/backfill'" not in page
 
-    def test_the_gap_summary_names_the_metrics_as_a_sentence(self, settings: Settings) -> None:
+    def test_the_gap_summary_names_the_metrics_as_a_sentence(
+        self, settings: GarminDbSettings
+    ) -> None:
         client, _ = linked_client(settings)
         with client:
             page = client.get("/setup", headers=OWNER).text
@@ -681,7 +713,7 @@ class TestTokenImportPage:
         assert "garmin_tokens.json" in page
         assert "garminconnect" in page
 
-    def test_a_linked_account_is_not_offered_it(self, settings: Settings) -> None:
+    def test_a_linked_account_is_not_offered_it(self, settings: GarminDbSettings) -> None:
         """A destructive-looking alternative should not sit on a working page."""
         linked, _ = linked_client(settings)
         with linked:
@@ -698,7 +730,7 @@ class TestTokenImportPage:
         assert client.get("/setup/status", headers=OWNER).json()["state"] == "linked"
 
     def test_the_imported_token_is_what_syncs_will_read(
-        self, client: TestClient, settings: Settings
+        self, client: TestClient, settings: GarminDbSettings
     ) -> None:
         client.post("/setup/token", data={"token": TOKEN_JSON}, headers=OWNER)
         manager_path = settings.token_file
@@ -762,7 +794,7 @@ class TestSyncIntervalControl:
     """How often the background sync runs, chosen on /setup."""
 
     def test_the_form_offers_the_intervals_with_the_saved_one_selected(
-        self, settings: Settings
+        self, settings: GarminDbSettings
     ) -> None:
         save_preferences(
             settings,
@@ -780,7 +812,7 @@ class TestSyncIntervalControl:
         for seconds in SYNC_INTERVAL_CHOICES:
             assert f"value='{seconds}'" in page
 
-    def test_saving_a_new_interval_takes_effect(self, settings: Settings) -> None:
+    def test_saving_a_new_interval_takes_effect(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             client.post(
@@ -792,7 +824,7 @@ class TestSyncIntervalControl:
         assert load_preferences(settings).sync_interval_seconds == 900
         assert status["interval_seconds"] == 900
 
-    def test_an_interval_not_offered_is_refused(self, settings: Settings) -> None:
+    def test_an_interval_not_offered_is_refused(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             response = client.post(
@@ -803,7 +835,9 @@ class TestSyncIntervalControl:
         assert response.status_code == 400
         assert load_preferences(settings).sync_interval_seconds == settings.sync_interval_seconds
 
-    def test_the_page_says_when_the_next_automatic_sync_is(self, settings: Settings) -> None:
+    def test_the_page_says_when_the_next_automatic_sync_is(
+        self, settings: GarminDbSettings
+    ) -> None:
         """Whether a sync needs pressing at all should not need reading the code."""
         client, _ = linked_client(settings)
         with client:
@@ -812,13 +846,15 @@ class TestSyncIntervalControl:
             page = client.get("/setup", headers=OWNER).text
         assert "Next automatic sync" in page
 
-    def test_before_any_sync_the_page_says_one_is_on_its_way(self, settings: Settings) -> None:
+    def test_before_any_sync_the_page_says_one_is_on_its_way(
+        self, settings: GarminDbSettings
+    ) -> None:
         client, _ = linked_client(settings)
         with client:
             page = client.get("/setup", headers=OWNER).text
         assert "automatic sync" in page.lower()
 
-    def test_status_reports_when_the_next_sync_is_due(self, settings: Settings) -> None:
+    def test_status_reports_when_the_next_sync_is_due(self, settings: GarminDbSettings) -> None:
         client, _ = linked_client(settings)
         with client:
             client.post("/sync", headers=OWNER)

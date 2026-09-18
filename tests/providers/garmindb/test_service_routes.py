@@ -20,10 +20,9 @@ from health_data_service.client import converter as consumer_converter
 from litestar.testing import TestClient
 
 from garmin_health.app import create_app
-from garmin_health.auth import GarminAuthenticator
-from garmin_health.config import Settings
+from garmin_health.providers.garmindb.auth import GarminAuthenticator
+from garmin_health.providers.garmindb.settings import GarminDbSettings
 from tests.providers.garmindb.fakes import RecordingFactory
-from tests.providers.garmindb.fixtures import HOME_TZ_NAME
 from tests.providers.garmindb.fixtures import Fixture
 from tests.providers.garmindb.fixtures import build_fixture
 
@@ -31,12 +30,7 @@ OWNER = {"X-OpenHost-Is-Owner": "true"}
 
 
 @pytest.fixture
-def corpus_settings(tmp_path: Path) -> Settings:
-    return Settings(app_data_dir=tmp_path / "appdata", home_tz=HOME_TZ_NAME)
-
-
-@pytest.fixture
-def corpus(corpus_settings: Settings) -> Fixture:
+def corpus(corpus_settings: GarminDbSettings) -> Fixture:
     return build_fixture(
         corpus_settings.health_data_dir,
         nights=3,
@@ -48,9 +42,9 @@ def corpus(corpus_settings: Settings) -> Fixture:
     )
 
 
-def app_client(settings: Settings) -> Iterator[TestClient]:
+def app_client(settings: GarminDbSettings) -> Iterator[TestClient]:
     app = create_app(
-        settings=settings,
+        provider_settings=settings,
         authenticator=GarminAuthenticator(
             settings, garmin_factory=RecordingFactory(needs_mfa=False)
         ),
@@ -60,11 +54,11 @@ def app_client(settings: Settings) -> Iterator[TestClient]:
 
 
 @pytest.fixture
-def client(corpus_settings: Settings, corpus: Fixture) -> Iterator[TestClient]:
+def client(corpus_settings: GarminDbSettings, corpus: Fixture) -> Iterator[TestClient]:
     yield from app_client(corpus_settings)
 
 
-def break_the_schema(settings: Settings) -> None:
+def break_the_schema(settings: GarminDbSettings) -> None:
     with sqlite3.connect(settings.db_dir / "garmin.db") as db:
         db.execute("UPDATE _attributes SET value = '1' WHERE key = 'db.version'")
 
@@ -128,7 +122,9 @@ class TestSleepSessions:
 
 class TestDegraded:
     @pytest.fixture
-    def broken_client(self, corpus_settings: Settings, corpus: Fixture) -> Iterator[TestClient]:
+    def broken_client(
+        self, corpus_settings: GarminDbSettings, corpus: Fixture
+    ) -> Iterator[TestClient]:
         break_the_schema(corpus_settings)
         yield from app_client(corpus_settings)
 
@@ -158,7 +154,7 @@ class TestDegraded:
 class TestNeverSynced:
     @pytest.fixture
     def fresh_client(self, tmp_path: Path) -> Iterator[TestClient]:
-        yield from app_client(Settings(app_data_dir=tmp_path / "appdata"))
+        yield from app_client(GarminDbSettings(app_data_dir=tmp_path / "appdata"))
 
     def test_a_container_with_no_corpus_at_all_answers_emptily(
         self, fresh_client: TestClient
@@ -177,7 +173,7 @@ class TestRebuildFromTheOwnerPage:
     the database files, and the container has no shell."""
 
     @pytest.fixture
-    def broken(self, corpus_settings: Settings, corpus: Fixture) -> Iterator[TestClient]:
+    def broken(self, corpus_settings: GarminDbSettings, corpus: Fixture) -> Iterator[TestClient]:
         break_the_schema(corpus_settings)
         yield from app_client(corpus_settings)
 

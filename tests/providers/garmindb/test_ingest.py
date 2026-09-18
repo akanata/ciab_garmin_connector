@@ -16,14 +16,14 @@ from threading import Event
 import pytest
 from garmindb.garmindb import Attributes
 
-from garmin_health.config import Settings
-from garmin_health.garmin_config import ensure_config
-from garmin_health.preferences import DOWNLOADABLE_STATS
-from garmin_health.preferences import ImportPreferences
-from garmin_health.preferences import save_preferences
 from garmin_health.providers.garmindb import ingest as ingest_module
+from garmin_health.providers.garmindb.config_file import ensure_config
 from garmin_health.providers.garmindb.ingest import Bindings
 from garmin_health.providers.garmindb.ingest import GarminDbIngest
+from garmin_health.providers.garmindb.preferences import DOWNLOADABLE_STATS
+from garmin_health.providers.garmindb.preferences import ImportPreferences
+from garmin_health.providers.garmindb.preferences import save_preferences
+from garmin_health.providers.garmindb.settings import GarminDbSettings
 from tests.providers.garmindb.fixtures import build_fixture
 
 
@@ -120,7 +120,7 @@ def make_ingest(
     calls: list[tuple[str, dt.date, int]] | None = None,
     temp_dirs: list[str] | None = None,
 ) -> GarminDbIngest:
-    settings = Settings(app_data_dir=tmp_path / "appdata")
+    settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
     ensure_config(settings, user="rider@example.com")
 
     def step(name: str, count: int = files):
@@ -149,7 +149,7 @@ def make_ingest(
 
 class TestTableStats:
     def test_counts_rows_in_a_real_corpus(self, tmp_path: Path) -> None:
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         ensure_config(settings, user="rider@example.com")
         build_fixture(settings.health_data_dir, nights=3, heart_rate=True)
 
@@ -161,7 +161,7 @@ class TestTableStats:
     def test_reports_the_latest_stored_value_as_an_iso_string(self, tmp_path: Path) -> None:
         """It is a naive local wall clock, not an instant, so it is deliberately not
         presented as a timestamp the caller might convert."""
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         ensure_config(settings, user="rider@example.com")
         fixture = build_fixture(settings.health_data_dir, nights=2)
 
@@ -171,7 +171,7 @@ class TestTableStats:
     def test_an_empty_corpus_reports_zeroes_rather_than_failing(self, tmp_path: Path) -> None:
         """A fresh install before the first sync is a normal, serviceable state:
         constructing the DB objects creates the schema."""
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         ensure_config(settings, user="rider@example.com")
 
         stats = GarminDbIngest(settings).table_stats()
@@ -183,13 +183,13 @@ class TestDownloadPlan:
     def test_falls_back_to_the_configured_start_date_on_an_empty_corpus(
         self, tmp_path: Path
     ) -> None:
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         ensure_config(settings, user="rider@example.com")
         plan = GarminDbIngest(settings).download_plan(today=dt.date(2026, 6, 15))
         assert plan["sleep"][0] == dt.date(2019, 12, 31)
 
     def test_uses_the_incremental_rule_once_rows_exist(self, tmp_path: Path) -> None:
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         ensure_config(settings, user="rider@example.com")
         build_fixture(settings.health_data_dir, nights=2, last_wake_day=dt.date(2026, 6, 15))
 
@@ -201,7 +201,7 @@ class TestDownloadPlan:
         """The reported bug, end to end. The corpus holds up to yesterday; Garmin
         Connect already shows last night (calendarDate today) and this morning's
         heart rate. Every stat's range has to reach today."""
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         ensure_config(settings, user="rider@example.com")
         build_fixture(
             settings.health_data_dir,
@@ -217,7 +217,7 @@ class TestDownloadPlan:
     def test_an_empty_corpus_backfill_reaches_today_too(self, tmp_path: Path) -> None:
         """GarminConnectConfigManager.stat_start_date computes its span with the
         same exclusive arithmetic, so even a first backfill stopped at yesterday."""
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         ensure_config(settings, user="rider@example.com")
         start, days = GarminDbIngest(settings).download_plan(today=dt.date(2026, 6, 15))["sleep"]
         assert start + dt.timedelta(days=days - 1) == dt.date(2026, 6, 15)
@@ -227,7 +227,7 @@ class TestDownloadPlan:
     ) -> None:
         """STAT_TABLES binds each statistic to the table both the plan and the
         coverage report measure. A private copy here could quietly drift from it."""
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         ensure_config(settings, user="rider@example.com")
         monkeypatch.setattr(
             ingest_module,
@@ -239,7 +239,7 @@ class TestDownloadPlan:
         assert "sleep" in plan
 
     def test_covers_every_enabled_stat(self, tmp_path: Path) -> None:
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         ensure_config(settings, user="rider@example.com")
         plan = GarminDbIngest(settings).download_plan(today=dt.date(2026, 6, 15))
         assert set(plan) == {"monitoring", "sleep", "rhr", "hrv"}
@@ -255,7 +255,7 @@ class TestPlanDate:
 
     @staticmethod
     def _ingest(tmp_path: Path, *, home_tz: str | None, now: dt.datetime) -> GarminDbIngest:
-        settings = Settings(app_data_dir=tmp_path / "appdata", home_tz=home_tz)
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata", home_tz=home_tz)
         ensure_config(settings, user="rider@example.com")
         return GarminDbIngest(settings, clock=lambda: now)
 
@@ -458,7 +458,7 @@ class TestConfigSafety:
     ) -> None:
         """GarminConnectConfigManager exits the process on a malformed config, which
         in a server is unrecoverable. The ingest must repair it first."""
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         settings.config_dir.mkdir(parents=True, exist_ok=True)
         settings.garmin_config_file.write_text("{ not json")
 
@@ -527,7 +527,7 @@ class TestRebuild:
 
             return make
 
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         ensure_config(settings, user="rider@example.com")
         bindings = Bindings(
             download=lambda gc_config: FakeDownload(log),
@@ -626,7 +626,7 @@ class TestStatCoverage:
     ) -> None:
         """The owner needs to see what a metric holds in order to decide whether
         to switch it back on."""
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         save_preferences(
             settings,
             ImportPreferences(start_date=dt.date(2020, 1, 1), enabled_stats=frozenset({"sleep"})),
@@ -640,7 +640,7 @@ class TestStatCoverage:
         assert coverage["monitoring"].enabled is False
 
     def test_it_reports_the_window_each_metric_actually_covers(self, tmp_path: Path) -> None:
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         save_preferences(
             settings,
             ImportPreferences(
@@ -657,7 +657,7 @@ class TestStatCoverage:
         assert sleep.floor == "2020-01-01"
 
     def test_the_gap_is_measured_against_the_owners_floor(self, tmp_path: Path) -> None:
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         save_preferences(
             settings,
             ImportPreferences(
@@ -670,7 +670,7 @@ class TestStatCoverage:
         assert sleep.has_gap is True
 
     def test_an_untouched_metric_reports_nothing_held_and_no_gap(self, tmp_path: Path) -> None:
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         build_fixture(settings.health_data_dir, nights=3)
         rhr = make_ingest(tmp_path, log=[]).stat_coverage()["rhr"]
         assert rhr.rows == 0
@@ -689,7 +689,7 @@ class TestBackfillDownload:
         stats: frozenset[str] = frozenset(DOWNLOADABLE_STATS),
         login_ok: bool = True,
     ) -> GarminDbIngest:
-        settings = Settings(app_data_dir=tmp_path / "appdata")
+        settings = GarminDbSettings(app_data_dir=tmp_path / "appdata")
         save_preferences(settings, ImportPreferences(start_date=floor, enabled_stats=stats))
         build_fixture(settings.health_data_dir, nights=3)
         return make_ingest(tmp_path, log=log, calls=calls, login_ok=login_ok)

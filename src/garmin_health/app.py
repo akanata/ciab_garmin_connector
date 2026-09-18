@@ -28,14 +28,15 @@ from litestar import Litestar
 from litestar import get
 from litestar.datastructures import State
 
-from garmin_health.auth import GarminAuthenticator
 from garmin_health.config import Settings
 from garmin_health.config import settings_from_env
-from garmin_health.preferences import load_preferences
+from garmin_health.providers.garmindb.auth import GarminAuthenticator
+from garmin_health.providers.garmindb.preferences import load_preferences
+from garmin_health.providers.garmindb.settings import GarminDbSettings
+from garmin_health.providers.garmindb.sync import Ingest
+from garmin_health.providers.garmindb.sync import SyncEngine
 from garmin_health.routes.owner import owner_router
 from garmin_health.routes.service import v1_router
-from garmin_health.sync import Ingest
-from garmin_health.sync import SyncEngine
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def _default_ingest_factory(settings: Settings) -> Callable[[], Ingest]:
+def _default_ingest_factory(settings: GarminDbSettings) -> Callable[[], Ingest]:
     def build() -> Ingest:
         # Imported lazily so nothing touches the config directory until there is
         # actually a sync to run.
@@ -72,12 +73,33 @@ def _default_ingest_factory(settings: Settings) -> Callable[[], Ingest]:
 def create_app(
     *,
     settings: Settings | None = None,
+    provider_settings: GarminDbSettings | None = None,
     authenticator: GarminAuthenticator | None = None,
     ingest_factory: Callable[[], Ingest] | None = None,
 ) -> Litestar:
-    settings = settings if settings is not None else settings_from_env()
-    authenticator = authenticator if authenticator is not None else GarminAuthenticator(settings)
-    state = State({"settings": settings, "authenticator": authenticator})
+    # Two settings objects while the provider boundary is half-built: the generic
+    # one knows the volume and which provider to run, the GarminDB one knows the
+    # corpus paths and the Garmin knobs. Phase 4 replaces `provider_settings`,
+    # `authenticator` and `ingest_factory` with a single `provider=` argument, and
+    # app.py stops naming GarminDB at all.
+    if settings is None:
+        settings = (
+            Settings(app_data_dir=provider_settings.app_data_dir)
+            if provider_settings is not None
+            else settings_from_env()
+        )
+    if provider_settings is None:
+        provider_settings = GarminDbSettings.from_env(settings.app_data_dir)
+    authenticator = (
+        authenticator if authenticator is not None else GarminAuthenticator(provider_settings)
+    )
+    state = State(
+        {
+            "settings": settings,
+            "provider_settings": provider_settings,
+            "authenticator": authenticator,
+        }
+    )
 
     def on_corpus_changed() -> None:
         """Called after every sync, on the event loop.
@@ -94,13 +116,13 @@ def create_app(
             service.invalidate()
 
     engine = SyncEngine(
-        settings=settings,
+        settings=provider_settings,
         authenticator=authenticator,
-        ingest_factory=ingest_factory or _default_ingest_factory(settings),
+        ingest_factory=ingest_factory or _default_ingest_factory(provider_settings),
         on_corpus_changed=on_corpus_changed,
         # The owner's saved interval, read fresh each time the loop decides when to
         # sync next; SYNC_INTERVAL_SECONDS only seeds it.
-        interval=lambda: load_preferences(settings).sync_interval_seconds,
+        interval=lambda: load_preferences(provider_settings).sync_interval_seconds,
     )
     state["sync_engine"] = engine
 
@@ -113,7 +135,7 @@ def create_app(
         from garmin_health.providers.garmindb.reader import GarminDbReader  # noqa: PLC0415
         from garmin_health.service import HealthDataService  # noqa: PLC0415
 
-        reader = GarminDbReader(GarminConnection(settings))
+        reader = GarminDbReader(GarminConnection(provider_settings))
         state["health_reader"] = reader
         state["health_service"] = HealthDataService(reader)
         if reader.fault is not None:

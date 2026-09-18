@@ -6,28 +6,20 @@ these are the entries this provider actually contributes, bound to a corpus.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from health_data_service import IntervalSample
 from health_data_service import TimeSeries
 
-from garmin_health.config import Settings
 from garmin_health.providers.garmindb.connection import GarminConnection
 from garmin_health.providers.garmindb.registry import metrics_for
-from tests.providers.garmindb.fixtures import HOME_TZ_NAME
+from garmin_health.providers.garmindb.settings import GarminDbSettings
 from tests.providers.garmindb.fixtures import build_fixture
 
 EXPECTED = {"heart_rate", "hrv_rmssd", "sleep_score", "readiness_resting_heart_rate"}
 
 
 @pytest.fixture
-def corpus_settings(tmp_path: Path) -> Settings:
-    return Settings(app_data_dir=tmp_path / "appdata", home_tz=HOME_TZ_NAME)
-
-
-@pytest.fixture
-def full_corpus(corpus_settings: Settings) -> Settings:
+def full_corpus(corpus_settings: GarminDbSettings) -> GarminDbSettings:
     build_fixture(
         corpus_settings.health_data_dir,
         nights=3,
@@ -39,12 +31,12 @@ def full_corpus(corpus_settings: Settings) -> Settings:
     return corpus_settings
 
 
-def test_this_iteration_serves_the_four_planned_metrics(corpus_settings: Settings) -> None:
+def test_this_iteration_serves_the_four_planned_metrics(corpus_settings: GarminDbSettings) -> None:
     with GarminConnection(corpus_settings) as conn:
         assert set(metrics_for(conn)) == EXPECTED
 
 
-def test_every_key_is_its_own_metric_id(corpus_settings: Settings) -> None:
+def test_every_key_is_its_own_metric_id(corpus_settings: GarminDbSettings) -> None:
     with GarminConnection(corpus_settings) as conn:
         for key, entry in metrics_for(conn).items():
             assert key == entry.descriptor.metric_id
@@ -61,19 +53,21 @@ def test_every_key_is_its_own_metric_id(corpus_settings: Settings) -> None:
         ("sleep_score", None),
     ],
 )
-def test_the_units_we_override(corpus_settings: Settings, metric_id: str, unit: str | None) -> None:
+def test_the_units_we_override(
+    corpus_settings: GarminDbSettings, metric_id: str, unit: str | None
+) -> None:
     with GarminConnection(corpus_settings) as conn:
         assert metrics_for(conn)[metric_id].descriptor.unit == unit
 
 
-def test_every_entry_names_the_column_it_reads(corpus_settings: Settings) -> None:
+def test_every_entry_names_the_column_it_reads(corpus_settings: GarminDbSettings) -> None:
     """Provenance is what makes a wrong number traceable to a table."""
     with GarminConnection(corpus_settings) as conn:
         for entry in metrics_for(conn).values():
             assert ".db:" in entry.provenance
 
 
-def test_built_samples_are_never_interval_samples(full_corpus: Settings) -> None:
+def test_built_samples_are_never_interval_samples(full_corpus: GarminDbSettings) -> None:
     with GarminConnection(full_corpus) as conn:
         for entry in metrics_for(conn).values():
             samples = entry.build(None, None, None)
@@ -81,7 +75,7 @@ def test_built_samples_are_never_interval_samples(full_corpus: Settings) -> None
             assert not any(isinstance(s, IntervalSample) for s in samples)
 
 
-def test_every_entry_builds_a_series_of_its_own_class(full_corpus: Settings) -> None:
+def test_every_entry_builds_a_series_of_its_own_class(full_corpus: GarminDbSettings) -> None:
     with GarminConnection(full_corpus) as conn:
         for entry in metrics_for(conn).values():
             series = entry.series(entry.build(None, None, None))
@@ -90,13 +84,13 @@ def test_every_entry_builds_a_series_of_its_own_class(full_corpus: Settings) -> 
             assert series.source == "garmin"
 
 
-def test_probes_report_an_empty_corpus_as_having_nothing(corpus_settings: Settings) -> None:
+def test_probes_report_an_empty_corpus_as_having_nothing(corpus_settings: GarminDbSettings) -> None:
     build_fixture(corpus_settings.health_data_dir, nights=0)
     with GarminConnection(corpus_settings) as conn:
         assert not any(entry.probe() for entry in metrics_for(conn).values())
 
 
-def test_probes_report_exactly_what_the_corpus_holds(corpus_settings: Settings) -> None:
+def test_probes_report_exactly_what_the_corpus_holds(corpus_settings: GarminDbSettings) -> None:
     build_fixture(corpus_settings.health_data_dir, nights=1, heart_rate=True)
     with GarminConnection(corpus_settings) as conn:
         advertised = {k for k, e in metrics_for(conn).items() if e.probe()}
@@ -104,7 +98,7 @@ def test_probes_report_exactly_what_the_corpus_holds(corpus_settings: Settings) 
 
 
 def test_the_entries_are_bound_to_the_connection_they_were_built_for(
-    corpus_settings: Settings,
+    corpus_settings: GarminDbSettings,
 ) -> None:
     """Binding is what lets registry.py stay free of GarminConnection: the
     builder closes over the connection instead of being handed one."""

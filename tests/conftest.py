@@ -23,10 +23,13 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     for name in (
         "BOTTLE_APP_DATA_DIR",
         "OPENHOST_APP_DATA_DIR",
+        "HEALTH_PROVIDER",
         "GARMIN_HOME_TZ",
         "GARMIN_IMPORT_TZ",
         "GARMIN_BACKFILL_START_DATE",
         "GARMIN_DOMAIN",
+        "GARMIN_FILL_STAGE_GAPS",
+        "GARMIN_DERIVE_RESTLESS_PERIODS",
         "SYNC_INTERVAL_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)

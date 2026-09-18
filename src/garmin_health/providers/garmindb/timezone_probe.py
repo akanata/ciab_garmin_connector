@@ -1,6 +1,6 @@
 """Read the timezone facts out of GarminDB and turn them into a TimeZonePolicy.
 
-The policy itself is pure and lives in ``garmin_health.timezones``; this module is
+The policy itself is pure and lives in ``garmin_health.providers.garmindb.timezones``; this module is
 the part that knows about tables.
 """
 
@@ -15,11 +15,11 @@ from garmindb.garmindb import GarminDb
 from garmindb.garmindb import Sleep
 from garmindb.garmindb import SleepEvents
 
-from garmin_health.timezones import DEFAULT_PROBE_NIGHTS
-from garmin_health.timezones import TimeZonePolicy
-from garmin_health.timezones import TimeZoneUnresolved
-from garmin_health.timezones import learn_import_offset
-from garmin_health.timezones import resolve_home_tz
+from garmin_health.providers.garmindb.timezones import DEFAULT_PROBE_NIGHTS
+from garmin_health.providers.garmindb.timezones import TimeZonePolicy
+from garmin_health.providers.garmindb.timezones import TimeZoneUnresolved
+from garmin_health.providers.garmindb.timezones import learn_import_offset
+from garmin_health.providers.garmindb.timezones import resolve_home_tz
 
 logger = logging.getLogger(__name__)
 

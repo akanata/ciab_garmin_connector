@@ -25,8 +25,8 @@ from pathlib import Path
 import attrs
 import dateutil.parser
 
-from garmin_health.config import DEFAULT_SYNC_INTERVAL_SECONDS
-from garmin_health.config import Settings
+from garmin_health.providers.garmindb.settings import DEFAULT_SYNC_INTERVAL_SECONDS
+from garmin_health.providers.garmindb.settings import GarminDbSettings
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ class ImportPreferences:
         }
 
     @classmethod
-    def defaults(cls, settings: Settings) -> ImportPreferences:
+    def defaults(cls, settings: GarminDbSettings) -> ImportPreferences:
         return cls(
             start_date=_parse_date(settings.backfill_start_date) or dt.date(2019, 12, 31),
             enabled_stats=frozenset(DOWNLOADABLE_STATS),
@@ -138,7 +138,7 @@ def _parse_date(raw: object) -> dt.date | None:
     return parsed
 
 
-def load_preferences(settings: Settings) -> ImportPreferences:
+def load_preferences(settings: GarminDbSettings) -> ImportPreferences:
     """Read the saved scope, falling back to the environment-seeded defaults.
 
     Never raises. A corrupt preferences file must not take out ``/setup``, which
@@ -206,7 +206,7 @@ def load_preferences(settings: Settings) -> ImportPreferences:
     )
 
 
-def save_preferences(settings: Settings, preferences: ImportPreferences) -> None:
+def save_preferences(settings: GarminDbSettings, preferences: ImportPreferences) -> None:
     """Persist the scope, replacing atomically so no reader sees a partial file."""
     path = settings.preferences_file
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -225,7 +225,7 @@ def save_preferences(settings: Settings, preferences: ImportPreferences) -> None
 
 
 def parse_preferences(
-    settings: Settings,
+    settings: GarminDbSettings,
     *,
     start_date: str,
     stats: Iterable[str],
@@ -290,5 +290,5 @@ def parse_preferences(
     )
 
 
-def preferences_path(settings: Settings) -> Path:
+def preferences_path(settings: GarminDbSettings) -> Path:
     return settings.preferences_file

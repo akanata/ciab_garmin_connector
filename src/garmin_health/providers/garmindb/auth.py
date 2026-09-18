@@ -37,9 +37,9 @@ import anyio.to_thread
 import attrs
 from garminconnect import Garmin
 
-from garmin_health.config import Settings
-from garmin_health.garmin_config import config_user
-from garmin_health.garmin_config import ensure_config
+from garmin_health.providers.garmindb.config_file import config_user
+from garmin_health.providers.garmindb.config_file import ensure_config
+from garmin_health.providers.garmindb.settings import GarminDbSettings
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,9 @@ def _default_garmin_factory(**kwargs: Any) -> Garmin:
 class GarminAuthenticator:
     """Owns the link state and the two-step MFA login."""
 
-    def __init__(self, settings: Settings, garmin_factory: GarminFactory | None = None) -> None:
+    def __init__(
+        self, settings: GarminDbSettings, garmin_factory: GarminFactory | None = None
+    ) -> None:
         self._settings = settings
         self._factory: GarminFactory = garmin_factory or _default_garmin_factory
         self._lock = Lock()

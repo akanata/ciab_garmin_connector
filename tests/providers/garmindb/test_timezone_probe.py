@@ -13,7 +13,7 @@ from garmindb.garmindb import MonitoringHeartRate
 from garmin_health.providers.garmindb.timezone_probe import read_offset_pairs
 from garmin_health.providers.garmindb.timezone_probe import read_stored_time_zone
 from garmin_health.providers.garmindb.timezone_probe import resolve_policy
-from garmin_health.timezones import TimeZoneUnresolved
+from garmin_health.providers.garmindb.timezones import TimeZoneUnresolved
 from tests.providers.garmindb.fixtures import HOME_TZ
 from tests.providers.garmindb.fixtures import HOME_TZ_NAME
 from tests.providers.garmindb.fixtures import build_fixture

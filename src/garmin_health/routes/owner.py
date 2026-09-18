@@ -33,24 +33,24 @@ from litestar.status_codes import HTTP_202_ACCEPTED
 from litestar.status_codes import HTTP_303_SEE_OTHER
 from litestar.status_codes import HTTP_409_CONFLICT
 
-from garmin_health.auth import AuthError
-from garmin_health.auth import AuthStatus
-from garmin_health.auth import GarminAuthenticator
-from garmin_health.auth import LinkState
-from garmin_health.garmin_config import ensure_config
-from garmin_health.preferences import DOWNLOADABLE_STATS
-from garmin_health.preferences import STAT_DETAIL
-from garmin_health.preferences import STAT_LABELS
-from garmin_health.preferences import SYNC_INTERVAL_CHOICES
-from garmin_health.preferences import ImportPreferences
-from garmin_health.preferences import InvalidPreferences
-from garmin_health.preferences import load_preferences
-from garmin_health.preferences import parse_preferences
-from garmin_health.preferences import save_preferences
-from garmin_health.preferences import sync_interval_label
 from garmin_health.progress import SyncStep
-from garmin_health.sync import StatCoverage
-from garmin_health.sync import SyncEngine
+from garmin_health.providers.garmindb.auth import AuthError
+from garmin_health.providers.garmindb.auth import AuthStatus
+from garmin_health.providers.garmindb.auth import GarminAuthenticator
+from garmin_health.providers.garmindb.auth import LinkState
+from garmin_health.providers.garmindb.config_file import ensure_config
+from garmin_health.providers.garmindb.preferences import DOWNLOADABLE_STATS
+from garmin_health.providers.garmindb.preferences import STAT_DETAIL
+from garmin_health.providers.garmindb.preferences import STAT_LABELS
+from garmin_health.providers.garmindb.preferences import SYNC_INTERVAL_CHOICES
+from garmin_health.providers.garmindb.preferences import ImportPreferences
+from garmin_health.providers.garmindb.preferences import InvalidPreferences
+from garmin_health.providers.garmindb.preferences import load_preferences
+from garmin_health.providers.garmindb.preferences import parse_preferences
+from garmin_health.providers.garmindb.preferences import save_preferences
+from garmin_health.providers.garmindb.preferences import sync_interval_label
+from garmin_health.providers.garmindb.sync import StatCoverage
+from garmin_health.providers.garmindb.sync import SyncEngine
 
 PASSWORD_NOTICE = (
     "Garmin does not offer a consent-based API outside its developer portal, so linking "
@@ -494,7 +494,7 @@ async def _page_view(
         # the page does not keep reporting a sign-in that failed once.
         error=authenticator.take_error() if consume_flash else authenticator.peek_error(),
         sync_summary=f"{_describe_last_sync(engine)} {_describe_schedule(engine)}",
-        preferences=load_preferences(state.settings),
+        preferences=load_preferences(state.provider_settings),
         coverage=coverage,
         step=engine.step,
         scope_error=scope_error,
@@ -525,7 +525,7 @@ async def submit_import_scope(
     try:
         raw_interval = data.get("sync_interval")
         preferences = parse_preferences(
-            state.settings,
+            state.provider_settings,
             start_date=str(data.get("start_date", "")),
             stats=stats,
             sync_interval=None if raw_interval is None else str(raw_interval),
@@ -534,13 +534,13 @@ async def submit_import_scope(
         view = await _page_view(state, scope_error=str(exc), consume_flash=False)
         return Response(content=_render(view), media_type=MediaType.HTML, status_code=400)
 
-    save_preferences(state.settings, preferences)
+    save_preferences(state.provider_settings, preferences)
     # Wake the loop, so a shorter interval applies now rather than after the long
     # wait it may already be part-way through.
     _sync_engine(state).reschedule()
     # Rewrite GarminConnectConfig.json now rather than at the next sync, so the
     # saved scope is what the next download reads even if this process restarts.
-    ensure_config(state.settings, preferences=preferences)
+    ensure_config(state.provider_settings, preferences=preferences)
     # The coverage table is measured against the floor that just changed.
     await _sync_engine(state).coverage(refresh=True)
     return Response(content="", status_code=HTTP_303_SEE_OTHER, headers={"Location": "/setup"})

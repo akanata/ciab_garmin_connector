@@ -38,11 +38,11 @@ from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from garmin_health.config import Settings
 from garmin_health.errors import ProviderUnavailable
+from garmin_health.providers.garmindb.settings import GarminDbSettings
 from garmin_health.providers.garmindb.timezone_probe import resolve_policy
-from garmin_health.timezones import TimeZonePolicy
-from garmin_health.timezones import TimeZoneUnresolved
+from garmin_health.providers.garmindb.timezones import TimeZonePolicy
+from garmin_health.providers.garmindb.timezones import TimeZoneUnresolved
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ class GarminConnection:
     crash-and-restart path anywhere in this class.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: GarminDbSettings) -> None:
         self._settings = settings
         # Guards the handle swap in reset(). It is NOT held for the duration of a
         # read: dispose() detaches in-use connections rather than closing them, so
@@ -209,7 +209,7 @@ class GarminConnection:
         return self._tz_error
 
     @property
-    def settings(self) -> Settings:
+    def settings(self) -> GarminDbSettings:
         return self._settings
 
     def status(self) -> dict[str, Any]:

@@ -12,10 +12,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from garmin_health.timezones import TimeZonePolicy
-from garmin_health.timezones import TimeZoneUnresolved
-from garmin_health.timezones import learn_import_offset
-from garmin_health.timezones import resolve_home_tz
+from garmin_health.providers.garmindb.timezones import TimeZonePolicy
+from garmin_health.providers.garmindb.timezones import TimeZoneUnresolved
+from garmin_health.providers.garmindb.timezones import learn_import_offset
+from garmin_health.providers.garmindb.timezones import resolve_home_tz
 
 DENVER = ZoneInfo("America/Denver")
 UTC = dt.UTC

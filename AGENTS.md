@@ -81,7 +81,10 @@ with no spec type — it would go under vendor-extension metric ids), and any
 push/webhook ingest. There is still no full-reimport endpoint *other* than
 `/rebuild`, which is a heavier hammer than a per-file retry.
 
-**Environment knobs:** `GARMIN_HOME_TZ`, `GARMIN_IMPORT_TZ`,
+**Environment knobs.** `config.py` reads exactly two: `HEALTH_PROVIDER` (default
+`garmindb`) and `BOTTLE_APP_DATA_DIR` (or the legacy `OPENHOST_APP_DATA_DIR`).
+Every knob below is read by `providers/garmindb/settings.py` instead, and a
+second provider would bring its own: `GARMIN_HOME_TZ`, `GARMIN_IMPORT_TZ`,
 `GARMIN_BACKFILL_START_DATE` (default `2019-12-31`; a full backfill is roughly
 one second per day *per stat*, so the default is hours on first run),
 `SYNC_INTERVAL_SECONDS` (default 1h; it only *seeds* the interval the owner sets on `/setup`), `GARMIN_DOMAIN`, `BOTTLE_APP_DATA_DIR` (or the legacy
@@ -143,21 +146,20 @@ Dockerfile, and test harness.
 
 ```
 src/garmin_health/
-  config.py         Settings (frozen attrs) from env. No I/O.
+  config.py         Settings (app_data_dir, provider) from env. No I/O.
   ports.py          HealthReader - what a provider hands the serving layer.
   errors.py         ProviderUnavailable / ProviderNotReady. Both map to 503.
   limits.py         resolve_limit, decimate, check_scan_cap. No provider content.
   progress.py       SyncStep / ProgressSink - what a running acquisition reports.
-  timezones.py      TimeZonePolicy - the ONLY place naive<->aware conversion happens.
   serialization.py  cattrs converter, hooks, the three response envelopes.
   registry.py       MetricEntry + metric_entry(). Declarative; no provider types.
   service.py        HealthDataService facade - the only thing routes/ imports.
-  garmin_config.py  Renders/validates GarminConnectConfig.json.
-  auth.py           Garmin login + MFA state machine.
-  sync.py           download -> import -> analyze; the background loop.
+  app.py            create_app(): wiring, the lifespans, the sync loop task.
   providers/
-    garmindb/       connection, reader, registry, sampling, vocabulary,
-                    heart_rate, sleep, daily.
+    garmindb/       settings, config_file (GarminConnectConfig.json), auth,
+                    preferences, sync (the engine + the Ingest port), ingest,
+                    timezones, timezone_probe, connection, reader, registry,
+                    sampling, vocabulary, heart_rate, sleep, daily.
   routes/           service.py (/api/v1/*), owner.py (/setup, /sync, /health).
 tests/
   providers/

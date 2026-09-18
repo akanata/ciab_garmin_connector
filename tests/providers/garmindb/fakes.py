@@ -21,8 +21,8 @@ from typing import Any
 
 from garminconnect import GarminConnectAuthenticationError
 
-from garmin_health.sync import StatCoverage
-from garmin_health.sync import TableStat
+from garmin_health.providers.garmindb.sync import StatCoverage
+from garmin_health.providers.garmindb.sync import TableStat
 
 
 class FakeInnerClient:

@@ -13,7 +13,7 @@ from garmin_health.errors import ProviderNotReady
 from garmin_health.errors import ProviderUnavailable
 from garmin_health.providers.garmindb.connection import GarminSchemaMismatch
 from garmin_health.providers.garmindb.connection import GarminUnavailable
-from garmin_health.timezones import TimeZoneUnresolved
+from garmin_health.providers.garmindb.timezones import TimeZoneUnresolved
 
 
 def test_an_unservable_corpus_is_a_provider_that_is_unavailable() -> None:

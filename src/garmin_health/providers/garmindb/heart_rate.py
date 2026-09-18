@@ -23,7 +23,7 @@ from garmin_health.limits import decimate
 from garmin_health.providers.garmindb.sampling import column_series
 from garmin_health.providers.garmindb.sampling import has_rows
 from garmin_health.providers.garmindb.sampling import period_rows
-from garmin_health.timezones import TimeZonePolicy
+from garmin_health.providers.garmindb.timezones import TimeZonePolicy
 
 logger = logging.getLogger(__name__)
 

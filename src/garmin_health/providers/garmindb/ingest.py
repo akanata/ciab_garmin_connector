@@ -44,21 +44,21 @@ from garmindb.garmindb import RestingHeartRate
 from garmindb.garmindb import Sleep
 from garmindb.garmindb import SleepEvents
 
-from garmin_health.config import Settings
-from garmin_health.garmin_config import load_manager
+from garmin_health.progress import ProgressSink
+from garmin_health.progress import no_progress
+from garmin_health.providers.garmindb.config_file import load_manager
 
 # TableStat is a plain value object on the port between sync.py and this adapter;
 # importing it here does not drag garmindb into sync.py, which is what keeps the
 # engine testable and GarminDB swappable.
-from garmin_health.preferences import STAT_LABELS
-from garmin_health.progress import ProgressSink
-from garmin_health.progress import no_progress
+from garmin_health.providers.garmindb.preferences import STAT_LABELS
+from garmin_health.providers.garmindb.settings import GarminDbSettings
+from garmin_health.providers.garmindb.sync import StatCoverage
+from garmin_health.providers.garmindb.sync import TableStat
+from garmin_health.providers.garmindb.sync import incremental_range
 from garmin_health.providers.garmindb.timezone_probe import read_stored_time_zone
-from garmin_health.sync import StatCoverage
-from garmin_health.sync import TableStat
-from garmin_health.sync import incremental_range
-from garmin_health.timezones import TimeZoneUnresolved
-from garmin_health.timezones import resolve_home_tz
+from garmin_health.providers.garmindb.timezones import TimeZoneUnresolved
+from garmin_health.providers.garmindb.timezones import resolve_home_tz
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ class GarminDbIngest:
 
     def __init__(
         self,
-        settings: Settings,
+        settings: GarminDbSettings,
         *,
         bindings: Bindings | None = None,
         clock: Callable[[], dt.datetime] = _utcnow,
