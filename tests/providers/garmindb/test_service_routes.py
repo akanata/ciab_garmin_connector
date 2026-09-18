@@ -19,10 +19,9 @@ from health_data_service import SleepSession
 from health_data_service.client import converter as consumer_converter
 from litestar.testing import TestClient
 
-from garmin_health.app import create_app
-from garmin_health.providers.garmindb.auth import GarminAuthenticator
 from garmin_health.providers.garmindb.settings import GarminDbSettings
-from tests.providers.garmindb.fakes import RecordingFactory
+from tests.providers.garmindb.fakes import client_for
+from tests.providers.garmindb.fakes import make_provider
 from tests.providers.garmindb.fixtures import Fixture
 from tests.providers.garmindb.fixtures import build_fixture
 
@@ -43,14 +42,7 @@ def corpus(corpus_settings: GarminDbSettings) -> Fixture:
 
 
 def app_client(settings: GarminDbSettings) -> Iterator[TestClient]:
-    app = create_app(
-        provider_settings=settings,
-        authenticator=GarminAuthenticator(
-            settings, garmin_factory=RecordingFactory(needs_mfa=False)
-        ),
-    )
-    with TestClient(app=app) as c:
-        yield c
+    yield from client_for(make_provider(settings))
 
 
 @pytest.fixture

@@ -16,7 +16,6 @@ from threading import Event
 import pytest
 
 from garmin_health.providers.garmindb.auth import GarminAuthenticator
-from garmin_health.providers.garmindb.auth import LinkState
 from garmin_health.providers.garmindb.settings import GarminDbSettings
 from garmin_health.providers.garmindb.sync import StatCoverage
 from garmin_health.providers.garmindb.sync import SyncEngine
@@ -255,12 +254,17 @@ class TestTrigger:
 
 
 class TestStatus:
-    def test_reports_the_link_state_before_any_sync(self, settings: GarminDbSettings) -> None:
+    def test_reports_nothing_running_before_any_sync(self, settings: GarminDbSettings) -> None:
         engine, _, _ = make_engine(settings, linked=False)
         status = engine.status()
-        assert status["link_state"] == LinkState.NOT_LINKED.value
         assert status["running"] is False
         assert status["last_sync"] is None
+
+    def test_it_does_not_report_the_link_state(self, settings: GarminDbSettings) -> None:
+        """The owner route reads that from the provider's AccountLink, which is
+        its one source. A second copy here would be free to drift from it."""
+        engine, _, _ = make_engine(settings, linked=False)
+        assert "link_state" not in engine.status()
 
     async def test_reports_tables_and_timings_after_a_sync(
         self, settings: GarminDbSettings

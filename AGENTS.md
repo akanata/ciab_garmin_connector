@@ -4,9 +4,16 @@ This application implements a producer for the Cloud in a Bottle health data
 spec from Garmin devices. The Garmin API itself is locked behind a developer
 application portal, so data is extracted using GarminDB.
 
-The service has two halves: an **ingest** side that drives GarminDB headlessly
-on a schedule to keep a local SQLite corpus fresh, and a **serve** side that
-maps those rows into `health_data_service` types over the spec's HTTP contract.
+The service has two halves. A **provider** owns acquisition: how the data is
+fetched, the store it writes, and the reader over that store. The **serving**
+side maps what that reader yields into `health_data_service` types over the
+spec's HTTP contract, and knows nothing about how any of it arrived.
+
+`garmindb` is the only provider today — it drives GarminDB headlessly on a
+schedule to keep a local SQLite corpus fresh. `HEALTH_PROVIDER` selects one.
+Polling is that provider's business, not the app's: a webhook-based aggregator
+(Terra, ROOK, Spike) would contribute a public route instead of a sync loop and
+nothing in `app.py` would change.
 
 ## Project Status
 
@@ -76,6 +83,18 @@ it on `/setup`. Its start is persisted, so a restart syncs as soon as one is due
 rather than waiting out a whole interval — see the Sync guardrails for how that
 keeps the crash-loop protection the old sleep-first loop provided.
 
+**Landed — the provider boundary** (`provider_refactor.md` Phases 1–4). `ports.py`
+defines what a provider is: `HealthReader`, `AccountLink`, `LinkState`/`LinkStatus`,
+`SetupView` and `Provider`. `providers/build_provider()` maps `HEALTH_PROVIDER` to
+one and is the only place in the app that names a concrete provider.
+`GarminDbProvider` owns the sync engine, the authenticator, the connection and
+its own half of `/setup`; `app.py` holds it only as a `Provider`. The seam is
+proved by a test-only `FakeProvider` and by `tests/providers/test_contract.py`,
+which runs one contract against both it and the real GarminDB provider, so the
+double cannot drift into being easier to satisfy than the thing it stands for.
+Phases 5–6 (the `TID251` ban, `test_boundary.py`, the `warn_once` registry) are
+still outstanding — **nothing mechanically enforces the boundary yet.**
+
 **Not built yet:** workouts, body battery (`daily_summary.bb_*`, available but
 with no spec type — it would go under vendor-extension metric ids), and any
 push/webhook ingest. There is still no full-reimport endpoint *other* than
@@ -136,51 +155,104 @@ Dockerfile, and test harness.
   every import from it degrades to `Any`.
 - **Wire types are attrs + cattrs, not pydantic.** All emitted timestamps are
   timezone-aware UTC, serialized as ISO 8601.
-- **Isolation rule:** only the `providers/garmindb/` package may import `garmindb`,
-  `idbutils`, `fitfile`, or `sqlalchemy`. Everything crossing that boundary is
-  a `health_data_service` type or a stdlib type. GarminDB may be swapped later
-  for the real Garmin API or a different unofficial API later; this must not
-  impact the HTTP layer.
+- **Isolation rule**, in three parts. (1) Only the `providers/garmindb/` package
+  may import `garmindb`, `idbutils`, `fitfile`, `garminconnect` or `sqlalchemy`.
+  Everything crossing that boundary is a `health_data_service` type, a
+  `ports.*` type, or a stdlib type. (2) The core must not name a concrete
+  provider: go through `providers.build_provider()`, which is the sole importer
+  of `providers.garmindb`. (3) Nothing under `providers/` may import
+  `garmin_health.app`, `.service` or `.routes.*` — a provider is a leaf. This is
+  why the owner page's shell lives in `setup_page.py` and not under `routes/`:
+  a provider has to import it to re-render the page when its own form fails.
+  GarminDB may be swapped for the real Garmin API or an aggregator later; this
+  must not impact the HTTP layer.
 
 ## Project Structure
 
 ```
 src/garmin_health/
   config.py         Settings (app_data_dir, provider) from env. No I/O.
-  ports.py          HealthReader - what a provider hands the serving layer.
+  ports.py          Provider, HealthReader, AccountLink, LinkState/LinkStatus,
+                    SetupView, SOURCE. The whole vocabulary of the boundary.
   errors.py         ProviderUnavailable / ProviderNotReady. Both map to 503.
   limits.py         resolve_limit, decimate, check_scan_cap. No provider content.
   progress.py       SyncStep / ProgressSink - what a running acquisition reports.
   serialization.py  cattrs converter, hooks, the three response envelopes.
   registry.py       MetricEntry + metric_entry(). Declarative; no provider types.
   service.py        HealthDataService facade - the only thing routes/ imports.
-  app.py            create_app(): wiring, the lifespans, the sync loop task.
+  setup_page.py     The owner page's shell: STYLE, BUSY_SCRIPT, button(),
+                    progress_line(), the headline per LinkState, the flash.
+                    Generic, and NOT under routes/ - providers import it.
+  app.py            create_app(*, settings, provider): wiring and the lifespans.
+                    Names no provider.
   providers/
-    garmindb/       settings, config_file (GarminConnectConfig.json), auth,
-                    preferences, sync (the engine + the Ingest port), ingest,
-                    timezones, timezone_probe, connection, reader, registry,
-                    sampling, vocabulary, heart_rate, sleep, daily.
-  routes/           service.py (/api/v1/*), owner.py (/setup, /sync, /health).
+    __init__.py     build_provider() - the ONLY importer of a concrete provider.
+    garmindb/       provider.py (GarminDbProvider: the port, the sync-loop
+                    lifespan, open_reader), owner.py (its half of /setup plus
+                    the seven gated handlers), settings, config_file
+                    (GarminConnectConfig.json), auth, preferences, sync (the
+                    engine + the Ingest port), ingest, timezones,
+                    timezone_probe, connection, reader, registry, sampling,
+                    vocabulary, heart_rate, sleep, daily.
+  routes/           service.py (/api/v1/*), owner.py (the guard + the shell:
+                    /setup, /setup/status, /setup/unlink, /sync/status).
 tests/
+  fakes.py          FakeReader / FakeLink / FakeProvider. Imports no provider.
   providers/
+    test_contract.py  One contract, run against FakeProvider AND GarminDbProvider.
     garmindb/       fixtures.py (build_fixture() - a real GarminDB SQLite in a
-                    tmpdir), fakes.py, and every test needing either.
+                    tmpdir), fakes.py (incl. make_provider()), and every test
+                    needing either.
 ```
 
 Dependency direction is strictly
-`routes -> service -> ports/registry/limits/errors -> health_data_service types`.
-**Nothing in that chain imports a provider.** The GarminDB reader is constructed
-in `app.py`'s lifespan and reaches `service.py` only as a `ports.HealthReader`;
-the ingest side reaches `sync.py` only as an `Ingest`. `timezones.py` is imported
-only by `providers/garmindb/*`. (`app.py`, `sync.py`, `auth.py`,
-`garmin_config.py` and `preferences.py` are still GarminDB-shaped and move under
-the provider in `provider_refactor.md` Phase 3-4; nothing enforces any of this
-until Phase 5.)
+`routes -> service -> ports/registry/limits/errors -> health_data_service types`,
+and `app -> providers (the selector) -> providers/garmindb`.
+**Nothing in the first chain imports a provider.** The reader is opened by
+`provider.open_reader()` in `app.py`'s lifespan and reaches `service.py` only as
+a `ports.HealthReader`; the ingest side reaches `sync.py` only as an `Ingest`.
+`timezones.py` is imported only by `providers/garmindb/*`.
+
+Note that the `Ingest` port is a testability seam *inside* the provider — it is
+what lets the whole sync sequence run with no account and no network. It is
+**not** the provider seam; `ports.Provider` is.
+
+Nothing mechanically enforces any of this yet: the `TID251` banned-import table
+and `tests/test_boundary.py` are `provider_refactor.md` Phase 5.
 
 ## Critical Guardrails & Gotchas
 
 **General**
 - ALWAYS IMPLEMENT UNIT TESTS BEFORE BUSINESS LOGIC (test-driven development).
+
+**Provider boundary.**
+
+- The link vocabulary is **generic**. `LinkState` has no `AWAITING_MFA`; it has
+  `PENDING`, because an aggregator links by OAuth redirect and has no MFA step
+  to await. The MFA wording lives in `LinkStatus.detail`, which the provider
+  writes. `LinkStatus.account` is whatever names the account — an email here, an
+  opaque id elsewhere. Both are on the wire: `/setup/status` returns
+  `{state, account, detail}` and `state` is `"pending"`, not `"awaiting_mfa"`.
+- `LinkStatus.detail` must be derived from the state **alone**, so reading it is
+  idempotent. A failure is never status: it is a one-shot flash, taken once by
+  `/setup` and only ever peeked at by the pollable `/setup/status`.
+- `Provider.status()` **must** carry `running` (bool) and `progress` (dict or
+  None). `BUSY_SCRIPT` is generic and polls `/sync/status` for exactly those.
+  `link_state` is *not* among them — the owner route reads that from
+  `provider.link`, which is its single source. `SyncEngine.status()` deliberately
+  no longer reports it, so the two cannot drift.
+- Owner routes are mounted by `app.py` on one router with a router-level guard,
+  so a provider handler cannot forget it. `public_routes()` go on a second,
+  guard-less router that is only mounted when non-empty — and every path there
+  must also be in `openhost.toml`'s `public_paths`, or the router never forwards
+  to it.
+- The reader's lifespan is **first** in the list, so a provider's own lifespans
+  nest inside it: the sync loop is cancelled before the reader closes, and its
+  callbacks always find a live service.
+- A test helper that fakes out more than the test asked for can silently make a
+  test unable to fail. `make_provider()` builds the **real** `GarminDbIngest`
+  unless a fake is explicitly passed, because the rebuild test has to actually
+  delete the database files.
 
 **Timezones — the highest-risk area of this project.**
 
@@ -467,7 +539,10 @@ until Phase 5.)
 - The token path must be exactly `<config_dir>/garmin_tokens.json`, which is
   what `GarminConnectConfigManager.get_token_store_file()` returns.
 - A sign-in failure is a **one-shot flash** (`take_error()`), not part of
-  `AuthStatus`. `AuthStatus.detail` is derived from the link state alone and must
+  `LinkStatus`. `LinkStatus.detail` is derived from the link state alone and must
   stay idempotent: anything sticky stored there is re-rendered on every later GET
   of `/setup`, so one mistyped password would accuse the owner forever. `/setup`
   consumes the flash; the pollable `/setup/status` only peeks.
+- `GarminAuthenticator` implements `ports.AccountLink`, and returns the shared
+  `LinkStatus` rather than a type of its own. An unfinished MFA challenge is
+  reported as `LinkState.PENDING`.

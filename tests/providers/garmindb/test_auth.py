@@ -4,9 +4,9 @@ import stat
 import pytest
 from garminconnect import GarminConnectAuthenticationError
 
+from garmin_health.ports import LinkState
 from garmin_health.providers.garmindb.auth import AuthError
 from garmin_health.providers.garmindb.auth import GarminAuthenticator
-from garmin_health.providers.garmindb.auth import LinkState
 from garmin_health.providers.garmindb.config_file import config_user
 from garmin_health.providers.garmindb.settings import GarminDbSettings
 from tests.providers.garmindb.fakes import RecordingFactory
@@ -36,7 +36,7 @@ async def test_login_without_mfa_links_immediately(settings: GarminDbSettings) -
     auth, _ = make_auth(settings, needs_mfa=False)
     status = await auth.login("rider@example.com", "hunter2")
     assert status.state is LinkState.LINKED
-    assert status.email == "rider@example.com"
+    assert status.account == "rider@example.com"
 
 
 async def test_login_passes_return_on_mfa_to_the_constructor(settings: GarminDbSettings) -> None:
@@ -59,12 +59,12 @@ async def test_login_persists_the_token_itself(settings: GarminDbSettings) -> No
     assert settings.token_file.is_file()
 
 
-async def test_mfa_challenge_moves_to_awaiting_and_does_not_write_a_token(
+async def test_mfa_challenge_moves_to_pending_and_does_not_write_a_token(
     settings: GarminDbSettings,
 ) -> None:
     auth, factory = make_auth(settings, needs_mfa=True)
     status = await auth.login("rider@example.com", "hunter2")
-    assert status.state is LinkState.AWAITING_MFA
+    assert status.state is LinkState.PENDING
     assert factory.clients[-1].client.dumped_to == []
     assert not settings.token_file.exists()
 
@@ -208,7 +208,7 @@ async def test_a_later_success_clears_an_earlier_failure(settings: GarminDbSetti
     assert auth.peek_error() is None
 
 
-async def test_awaiting_mfa_detail_survives_being_read_twice(settings: GarminDbSettings) -> None:
+async def test_pending_detail_survives_being_read_twice(settings: GarminDbSettings) -> None:
     auth, _ = make_auth(settings, needs_mfa=True)
     await auth.login("rider@example.com", "hunter2")
     assert auth.status().detail == auth.status().detail
@@ -265,7 +265,7 @@ class TestTokenImport:
     async def test_the_email_is_recorded_for_the_config(self, settings: GarminDbSettings) -> None:
         auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory())
         await auth.link_with_token(VALID_TOKEN, email="rider@example.com")
-        assert auth.status().email == "rider@example.com"
+        assert auth.status().account == "rider@example.com"
         assert config_user(settings) == "rider@example.com"
 
     async def test_the_email_is_optional(self, settings: GarminDbSettings) -> None:
@@ -325,7 +325,7 @@ class TestTokenImport:
         a challenge left over from a failed sign-in must not outlive it."""
         auth = GarminAuthenticator(settings, garmin_factory=RecordingFactory(needs_mfa=True))
         await auth.login("rider@example.com", "hunter2")
-        assert auth.status().state is LinkState.AWAITING_MFA
+        assert auth.status().state is LinkState.PENDING
 
         await auth.link_with_token(VALID_TOKEN, email="")
         assert auth.status().state is LinkState.LINKED
