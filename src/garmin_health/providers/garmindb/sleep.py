@@ -41,6 +41,7 @@ from health_data_service import SleepStage
 from health_data_service import SleepStages
 from sqlalchemy.orm import Session
 
+from garmin_health.ports import SOURCE
 from garmin_health.providers.garmindb.connection import GarminConnection
 from garmin_health.providers.garmindb.heart_rate import heart_rate_stats
 from garmin_health.providers.garmindb.heart_rate import session_heart_rate
@@ -51,8 +52,6 @@ from garmin_health.providers.garmindb.timezones import TimeZonePolicy
 from garmin_health.providers.garmindb.vocabulary import stage_for_event
 
 logger = logging.getLogger(__name__)
-
-SOURCE = "garmin"
 
 # Garmin's calendarDate-to-bedtime semantics are not worth guessing at, so events
 # are searched over a wide window around `day` and then clustered.

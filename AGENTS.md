@@ -83,8 +83,8 @@ it on `/setup`. Its start is persisted, so a restart syncs as soon as one is due
 rather than waiting out a whole interval — see the Sync guardrails for how that
 keeps the crash-loop protection the old sleep-first loop provided.
 
-**Landed — the provider boundary** (`provider_refactor.md` Phases 1–4). `ports.py`
-defines what a provider is: `HealthReader`, `AccountLink`, `LinkState`/`LinkStatus`,
+**Landed — the provider boundary** (`plan.md` Addendum A is the design of record).
+`ports.py` defines what a provider is: `HealthReader`, `AccountLink`, `LinkState`/`LinkStatus`,
 `SetupView` and `Provider`. `providers/build_provider()` maps `HEALTH_PROVIDER` to
 one and is the only place in the app that names a concrete provider.
 `GarminDbProvider` owns the sync engine, the authenticator, the connection and
@@ -94,8 +94,12 @@ which runs one contract against both it and the real GarminDB provider, so the
 double cannot drift into being easier to satisfy than the thing it stands for.
 **The boundary is now enforced**, not merely observed: `TID251` bans the vendor
 libraries and the concrete-provider import at lint time, and `tests/test_boundary.py`
-walks the import graph for the half a lint rule cannot state. Phase 6 (the
-`warn_once` registry, deduping `SOURCE`) is the only part still outstanding.
+walks the import graph for the half a lint rule cannot state. The refactor is
+complete. Three follow-ups were scoped and deliberately left unstarted — a
+uniform scan cap (a **behaviour change**: windows that succeed today would start
+answering 413), lifting sleep assembly, and parameterising
+`MAX_SESSION_SUBSERIES`. `plan.md` Addendum A records why, under "Deliberately
+not done".
 
 **Not built yet:** workouts, body battery (`daily_summary.bb_*`, available but
 with no spec type — it would go under vendor-extension metric ids), and any
@@ -184,6 +188,7 @@ src/garmin_health/
   errors.py         ProviderUnavailable / ProviderNotReady. Both map to 503.
   limits.py         resolve_limit, decimate, check_scan_cap. No provider content.
   progress.py       SyncStep / ProgressSink - what a running acquisition reports.
+  warn_once.py      WarnOnce(logger, message) - one warning per distinct token.
   serialization.py  cattrs converter, hooks, the three response envelopes.
   registry.py       MetricEntry + metric_entry(). Declarative; no provider types.
   service.py        HealthDataService facade - the only thing routes/ imports.
@@ -265,6 +270,15 @@ boundary should fail `ruff check` before it ever reaches a test.
   test unable to fail. `make_provider()` builds the **real** `GarminDbIngest`
   unless a fake is explicitly passed, because the rebuild test has to actually
   delete the database files.
+- **`SOURCE` is defined once**, in `ports.py`, and means the device the data came
+  off — Garmin whichever way it reached us. Do not re-declare it in a provider
+  module: a consumer merging across providers keys on it, and two copies are free
+  to diverge. Import it from `garmin_health.ports`, never through `registry.py`,
+  which only re-exports it — mypy's `no_implicit_reexport` rejects that, and the
+  definition site is the honest import anyway.
+- Mapping a vendor vocabulary onto the spec's always has an unmapped case, and it
+  is per *row*. Use `WarnOnce` so a newly added vendor value is visible exactly
+  once instead of being repeated hundreds of times a night or degrading silently.
 
 **Timezones — the highest-risk area of this project.**
 

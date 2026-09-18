@@ -690,3 +690,11 @@ Dependency direction: `routes → service → ports/registry/limits/errors → s
 ### What a second provider should cost
 
 The falsifiable claim this whole exercise rests on: adding one is a new package under `providers/`, plus one string in `PROVIDER_NAMES`. It should touch **no existing source file**. If it turns out to need more, the boundary is still in the wrong place — and that is worth finding out cheaply.
+
+### Deliberately not done
+
+Three follow-ups were scoped and left unstarted. They are recorded here because the working document that held them has been removed now that Phases 1–6 have landed.
+
+- **A uniform scan cap.** `MAX_ROWS_SCANNED` currently guards one of the four read paths. Applying it to `build_resting_heart_rate` and `build_sleep_sessions` as well is a **behaviour change** — windows that succeed today would start answering 413 — so it deserves a deliberate decision rather than being swept up as tidying. `check_scan_cap` already reads the cap at call time, so the tests for it can monkeypatch. `heart_rate._window_samples` should stay uncapped either way: a per-night count per sub-series doubles every session's query cost, and the night window already bounds the work.
+- **Lifting sleep assembly.** `clean_intervals`, `stage_totals`, `resolve_durations`, `efficiency`, `restless_periods` and `window_from_intervals` are assembly *policy* rather than anything GarminDB-specific, and could move to a provider-agnostic `sleep_assembly.py` behind pure-function tests. Worth doing only when a second provider actually arrives — until then it is churn, and the 57 corpus tests are the regression net that makes it safe later.
+- **`MAX_SESSION_SUBSERIES` as a parameter** of `session_heart_rate`/`session_hrv`, rather than a module-level constant read directly.
