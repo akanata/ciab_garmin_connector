@@ -4,34 +4,27 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from pathlib import Path
 
 import pytest
 
-from garmin_health.config import Settings
 from garmin_health.providers.garmindb.connection import GarminConnection
 from garmin_health.providers.garmindb.daily import build_resting_heart_rate
 from garmin_health.providers.garmindb.daily import build_sleep_score
 from garmin_health.providers.garmindb.daily import has_resting_heart_rate
 from garmin_health.providers.garmindb.daily import has_sleep_score
-from tests.providers.garmindb.fixtures import HOME_TZ_NAME
+from garmin_health.providers.garmindb.settings import GarminDbSettings
 from tests.providers.garmindb.fixtures import build_fixture
 
 
-@pytest.fixture
-def corpus_settings(tmp_path: Path) -> Settings:
-    return Settings(app_data_dir=tmp_path / "appdata", home_tz=HOME_TZ_NAME)
-
-
 class TestSleepScore:
-    def test_one_sample_per_night(self, corpus_settings: Settings) -> None:
+    def test_one_sample_per_night(self, corpus_settings: GarminDbSettings) -> None:
         build_fixture(corpus_settings.health_data_dir, nights=3, sleep_score=82)
         with GarminConnection(corpus_settings) as conn:
             samples = build_sleep_score(conn, None, None, None)
         assert [s.value for s in samples] == [82.0, 82.0, 82.0]
 
     def test_nights_without_a_score_are_skipped_rather_than_zeroed(
-        self, corpus_settings: Settings
+        self, corpus_settings: GarminDbSettings
     ) -> None:
         """sleep.score is nullable, and a night Garmin did not score is not a
         night that scored zero."""
@@ -40,7 +33,7 @@ class TestSleepScore:
             assert build_sleep_score(conn, None, None, None) == []
 
     def test_a_day_keyed_sample_lands_on_local_midnight_expressed_in_utc(
-        self, corpus_settings: Settings
+        self, corpus_settings: GarminDbSettings
     ) -> None:
         """Local midnight in Denver in June is 06:00Z, not 00:00Z. Emitting 00:00Z
         would be a second, inconsistent convention that places the sample on the
@@ -57,20 +50,22 @@ class TestSleepScore:
         assert samples[0].timestamp == dt.datetime(2026, 6, 15, 6, 0, tzinfo=dt.UTC)
         assert samples[0].timestamp.date() == fixture.newest.wake_day
 
-    def test_the_probe_follows_the_data(self, corpus_settings: Settings) -> None:
+    def test_the_probe_follows_the_data(self, corpus_settings: GarminDbSettings) -> None:
         build_fixture(corpus_settings.health_data_dir, nights=1, sleep_score=None)
         with GarminConnection(corpus_settings) as conn:
             assert has_sleep_score(conn) is False
 
 
 class TestRestingHeartRate:
-    def test_it_reads_the_resting_hr_table(self, corpus_settings: Settings) -> None:
+    def test_it_reads_the_resting_hr_table(self, corpus_settings: GarminDbSettings) -> None:
         build_fixture(corpus_settings.health_data_dir, nights=3, resting_hr=True)
         with GarminConnection(corpus_settings) as conn:
             samples = build_resting_heart_rate(conn, None, None, None)
         assert [s.value for s in samples] == [52.0, 53.0, 54.0]
 
-    def test_it_falls_back_to_the_daily_summary_column(self, corpus_settings: Settings) -> None:
+    def test_it_falls_back_to_the_daily_summary_column(
+        self, corpus_settings: GarminDbSettings
+    ) -> None:
         """resting_hr and daily_summary come from different downloads, so a corpus
         can easily have one and not the other."""
         build_fixture(
@@ -81,7 +76,7 @@ class TestRestingHeartRate:
         assert [s.value for s in samples] == [60.0, 61.0, 62.0]
 
     def test_the_fallback_is_logged_when_it_fires(
-        self, corpus_settings: Settings, caplog: pytest.LogCaptureFixture
+        self, corpus_settings: GarminDbSettings, caplog: pytest.LogCaptureFixture
     ) -> None:
         build_fixture(corpus_settings.health_data_dir, nights=1, daily_summary_rhr=True)
         with GarminConnection(corpus_settings) as conn:
@@ -89,7 +84,9 @@ class TestRestingHeartRate:
                 build_resting_heart_rate(conn, None, None, None)
         assert "daily_summary" in caplog.text
 
-    def test_the_primary_table_wins_when_both_are_present(self, corpus_settings: Settings) -> None:
+    def test_the_primary_table_wins_when_both_are_present(
+        self, corpus_settings: GarminDbSettings
+    ) -> None:
         build_fixture(
             corpus_settings.health_data_dir, nights=3, resting_hr=True, daily_summary_rhr=True
         )
@@ -97,7 +94,7 @@ class TestRestingHeartRate:
             samples = build_resting_heart_rate(conn, None, None, None)
         assert [s.value for s in samples] == [52.0, 53.0, 54.0]
 
-    def test_neither_table_means_an_empty_series(self, corpus_settings: Settings) -> None:
+    def test_neither_table_means_an_empty_series(self, corpus_settings: GarminDbSettings) -> None:
         build_fixture(corpus_settings.health_data_dir, nights=3)
         with GarminConnection(corpus_settings) as conn:
             assert build_resting_heart_rate(conn, None, None, None) == []
@@ -107,7 +104,7 @@ class TestRestingHeartRate:
         [({"resting_hr": True}, 54.0), ({"daily_summary_rhr": True}, 62.0)],
     )
     def test_the_window_is_honoured_on_both_paths(
-        self, corpus_settings: Settings, kwargs: dict[str, bool], expected: float
+        self, corpus_settings: GarminDbSettings, kwargs: dict[str, bool], expected: float
     ) -> None:
         """Day-keyed rows are filtered on local midnight expressed in UTC, so the
         fallback must not quietly widen the window the primary path applied."""
@@ -117,12 +114,12 @@ class TestRestingHeartRate:
             samples = build_resting_heart_rate(conn, newest_midnight, None, None)
         assert [s.value for s in samples] == [expected]
 
-    def test_the_probe_sees_either_table(self, corpus_settings: Settings) -> None:
+    def test_the_probe_sees_either_table(self, corpus_settings: GarminDbSettings) -> None:
         build_fixture(corpus_settings.health_data_dir, nights=1, daily_summary_rhr=True)
         with GarminConnection(corpus_settings) as conn:
             assert has_resting_heart_rate(conn) is True
 
-    def test_the_probe_is_false_with_neither(self, corpus_settings: Settings) -> None:
+    def test_the_probe_is_false_with_neither(self, corpus_settings: GarminDbSettings) -> None:
         build_fixture(corpus_settings.health_data_dir, nights=1)
         with GarminConnection(corpus_settings) as conn:
             assert has_resting_heart_rate(conn) is False

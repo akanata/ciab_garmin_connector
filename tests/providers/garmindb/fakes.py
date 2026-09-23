@@ -16,13 +16,19 @@ off garminconnect 0.3.11:
 
 import json
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from garminconnect import GarminConnectAuthenticationError
+from litestar.testing import TestClient
 
-from garmin_health.sync import StatCoverage
-from garmin_health.sync import TableStat
+from garmin_health.app import create_app
+from garmin_health.providers.garmindb.auth import GarminAuthenticator
+from garmin_health.providers.garmindb.provider import GarminDbProvider
+from garmin_health.providers.garmindb.settings import GarminDbSettings
+from garmin_health.providers.garmindb.sync import StatCoverage
+from garmin_health.providers.garmindb.sync import TableStat
 
 
 class FakeInnerClient:
@@ -235,3 +241,38 @@ class ReportingIngest(FakeIngest):
             progress("Importing downloaded files", 0, 0)
         self._seen_from()
         self._record("import")
+
+
+def make_provider(
+    settings: GarminDbSettings,
+    *,
+    factory: RecordingFactory | None = None,
+    ingest: FakeIngest | None = None,
+    linked: bool = False,
+) -> GarminDbProvider:
+    """A real GarminDbProvider, with the Garmin network faked out.
+
+    Passing ``ingest`` is the only way to get a fake one. Left out, the provider
+    builds its **real** ``GarminDbIngest``: an end-to-end test that rebuilds the
+    corpus has to actually delete the database files, not record that it would
+    have. Defaulting this to a fake quietly turned the rebuild test into one that
+    could not fail.
+
+    ``linked=True`` plants the token file, which is the whole of "linked" as far
+    as the authenticator is concerned -- exactly what a restart sees.
+    """
+    if linked:
+        settings.config_dir.mkdir(parents=True, exist_ok=True)
+        settings.token_file.write_text('{"di_refresh_token": "r"}')
+    return GarminDbProvider(
+        settings,
+        authenticator=GarminAuthenticator(
+            settings, garmin_factory=factory or RecordingFactory(needs_mfa=False)
+        ),
+        ingest_factory=None if ingest is None else (lambda: ingest),
+    )
+
+
+def client_for(provider: GarminDbProvider) -> Iterator[TestClient]:
+    with TestClient(app=create_app(provider=provider)) as client:
+        yield client

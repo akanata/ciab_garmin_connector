@@ -1,49 +1,42 @@
-"""Litestar application: the health probe, the owner surface, /v1/*, and the sync loop.
+"""Litestar application: the health probe, the owner surface, /v1/*, and wiring.
 
 Three things are wired together here and nowhere else:
 
-- The **GarminConnection** is opened once in a lifespan hook rather than at import,
-  so nothing touches the data directory until the process is actually starting, and
-  a stale schema degrades ``/v1/*`` to 503 without taking ``/health`` or ``/setup``
-  with it.
-- The **sync engine** is given a callback that resets that connection. After a
-  rebuild, pooled handles point at the deleted inode and would go on serving stale
-  rows silently; and the account's timezone only arrives with the first profile
-  import, so the boot-time resolution legitimately has to be retried.
+- The **reader** is opened once in a lifespan hook rather than at import, so
+  nothing touches the data directory until the process is actually starting, and
+  a degraded provider drops ``/v1/*`` to 503 without taking ``/health`` or
+  ``/setup`` with it. It is opened first and closed last, so a provider's own
+  lifespans nest inside it and their callbacks always find a service.
+- **Data-changed notifications** drop the serving layer's catalog cache. The
+  provider decides when that is -- after a sync here, after a webhook payload
+  elsewhere -- and the app only has to subscribe.
 - ``/health`` stays unconditional. An unlinked account, a stale corpus and an
-  unreachable Garmin are all normal states awaiting attention, and failing the
+  unreachable upstream are all normal states awaiting attention, and failing the
   probe for any of them makes the router restart a container that is working.
+
+Nothing in this module names a provider. ``build_provider`` maps the configured
+name to one; everything else here is stated against ``ports.Provider``.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import logging
 from collections.abc import AsyncGenerator
-from collections.abc import Callable
 from contextlib import asynccontextmanager
 
 from litestar import Litestar
+from litestar import Router
 from litestar import get
 from litestar.datastructures import State
 
-from garmin_health.auth import GarminAuthenticator
 from garmin_health.config import Settings
 from garmin_health.config import settings_from_env
-from garmin_health.preferences import load_preferences
+from garmin_health.ports import Provider
+from garmin_health.providers import build_provider
 from garmin_health.routes.owner import owner_router
 from garmin_health.routes.service import v1_router
-from garmin_health.sync import Ingest
-from garmin_health.sync import SyncEngine
 
 logger = logging.getLogger(__name__)
-
-# How long shutdown waits for the loop task to unwind. An in-flight download blocks
-# in time.sleep and cannot be interrupted, so it is abandoned rather than awaited;
-# GarminDB commits per file and the retained JSON/FIT corpus makes a partial import
-# re-runnable without re-downloading.
-SHUTDOWN_GRACE_SECONDS = 5.0
 
 
 @get("/health", sync_to_thread=False)
@@ -51,91 +44,69 @@ def health() -> dict[str, str]:
     """The router's liveness probe.
 
     Deliberately unconditional: an unlinked account, a stale sync or an
-    unreachable Garmin are all normal states awaiting attention, and failing the
+    unreachable upstream are all normal states awaiting attention, and failing the
     probe for any of them would make the router restart a container that is
     working correctly.
     """
     return {"status": "ok"}
 
 
-def _default_ingest_factory(settings: Settings) -> Callable[[], Ingest]:
-    def build() -> Ingest:
-        # Imported lazily so nothing touches the config directory until there is
-        # actually a sync to run.
-        from garmin_health.providers.garmindb.ingest import GarminDbIngest  # noqa: PLC0415
+def create_app(*, settings: Settings | None = None, provider: Provider | None = None) -> Litestar:
+    """Build the app.
 
-        return GarminDbIngest(settings)
+    ``provider`` is injectable so tests can mount a double; left out, the
+    configured one is built from the environment.
+    """
+    if settings is None:
+        settings = settings_from_env()
+    if provider is None:
+        provider = build_provider(settings)
+    state = State({"settings": settings, "provider": provider})
 
-    return build
+    def on_data_changed() -> None:
+        """Drop the catalog cache after newly acquired data lands.
 
-
-def create_app(
-    *,
-    settings: Settings | None = None,
-    authenticator: GarminAuthenticator | None = None,
-    ingest_factory: Callable[[], Ingest] | None = None,
-) -> Litestar:
-    settings = settings if settings is not None else settings_from_env()
-    authenticator = authenticator if authenticator is not None else GarminAuthenticator(settings)
-    state = State({"settings": settings, "authenticator": authenticator})
-
-    def on_corpus_changed() -> None:
-        """Called after every sync, on the sync's own worker thread.
-
-        Cheap (two ``engine.dispose()`` calls and two DB constructions) and the
-        only thing that makes a rebuilt corpus, or a timezone that arrived with the
-        first profile import, visible to the serving layer.
+        The provider has already made the new data readable by the time this
+        runs; all that is left is that the catalog was probed before it existed.
         """
         service = state.get("health_service")
-        if service is None:
-            return
-        service.connection.reset()
-        service.invalidate()
+        if service is not None:
+            service.invalidate()
 
-    engine = SyncEngine(
-        settings=settings,
-        authenticator=authenticator,
-        ingest_factory=ingest_factory or _default_ingest_factory(settings),
-        on_corpus_changed=on_corpus_changed,
-        # The owner's saved interval, read fresh each time the loop decides when to
-        # sync next; SYNC_INTERVAL_SECONDS only seeds it.
-        interval=lambda: load_preferences(settings).sync_interval_seconds,
-    )
-    state["sync_engine"] = engine
+    provider.subscribe_data_changed(on_data_changed)
 
     @asynccontextmanager
     async def serving_layer(_: Litestar) -> AsyncGenerator[None, None]:
-        # Imported here rather than at module scope so the GarminDB import cost is
+        # Imported here rather than at module scope so the reader's import cost is
         # paid at startup rather than at import, which keeps `create_app` cheap for
         # anything that only wants to inspect the routes.
-        from garmin_health.providers.garmindb.connection import GarminConnection  # noqa: PLC0415
         from garmin_health.service import HealthDataService  # noqa: PLC0415
 
-        connection = GarminConnection(settings)
-        state["health_service"] = HealthDataService(connection)
-        if connection.fault is not None:
-            logger.error("Serving layer degraded: %s", connection.fault)
+        reader = provider.open_reader()
+        state["health_reader"] = reader
+        state["health_service"] = HealthDataService(reader)
+        if reader.fault is not None:
+            logger.error("Serving layer degraded: %s", reader.fault)
         try:
             yield
         finally:
             state.pop("health_service", None)
-            connection.close()
+            state.pop("health_reader", None)
+            reader.close()
 
-    @asynccontextmanager
-    async def sync_loop(_: Litestar) -> AsyncGenerator[None, None]:
-        task = asyncio.create_task(engine.run_forever())
-        try:
-            yield
-        finally:
-            engine.request_stop()
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, TimeoutError):
-                await asyncio.wait_for(task, timeout=SHUTDOWN_GRACE_SECONDS)
+    route_handlers: list[object] = [health, owner_router(provider), v1_router]
+    public = provider.public_routes()
+    if public:
+        # A second, guard-less router. Only mounted when a provider actually has
+        # ungated routes, so the app has no unguarded surface by default.
+        route_handlers.append(Router(path="/", route_handlers=list(public)))
 
     return Litestar(
-        route_handlers=[health, owner_router, v1_router],
+        route_handlers=route_handlers,  # type: ignore[arg-type]
         state=state,
-        lifespan=[serving_layer, sync_loop],
+        # The reader's lifespan is first, so the provider's own lifespans start
+        # after it and are cancelled before it closes.
+        lifespan=[serving_layer, *provider.lifespans()],
     )
 
 

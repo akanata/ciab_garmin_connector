@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import logging
-from enum import StrEnum
 from threading import Lock
 from typing import Any
 from typing import Protocol
@@ -37,9 +36,11 @@ import anyio.to_thread
 import attrs
 from garminconnect import Garmin
 
-from garmin_health.config import Settings
-from garmin_health.garmin_config import config_user
-from garmin_health.garmin_config import ensure_config
+from garmin_health.ports import LinkState
+from garmin_health.ports import LinkStatus
+from garmin_health.providers.garmindb.config_file import config_user
+from garmin_health.providers.garmindb.config_file import ensure_config
+from garmin_health.providers.garmindb.settings import GarminDbSettings
 
 logger = logging.getLogger(__name__)
 
@@ -55,25 +56,8 @@ class AuthError(Exception):
     """The owner-facing reason a link attempt did not succeed."""
 
 
-class LinkState(StrEnum):
-    NOT_LINKED = "not_linked"
-    AWAITING_MFA = "awaiting_mfa"
-    LINKED = "linked"
-    NEEDS_REAUTH = "needs_reauth"
-
-
 class GarminFactory(Protocol):
     def __call__(self, **kwargs: Any) -> Any: ...
-
-
-@attrs.frozen
-class AuthStatus:
-    state: LinkState
-    email: str | None = None
-    detail: str | None = None
-
-    def as_dict(self) -> dict[str, str | None]:
-        return {"state": self.state.value, "email": self.email, "detail": self.detail}
 
 
 @attrs.define
@@ -91,7 +75,9 @@ def _default_garmin_factory(**kwargs: Any) -> Garmin:
 class GarminAuthenticator:
     """Owns the link state and the two-step MFA login."""
 
-    def __init__(self, settings: Settings, garmin_factory: GarminFactory | None = None) -> None:
+    def __init__(
+        self, settings: GarminDbSettings, garmin_factory: GarminFactory | None = None
+    ) -> None:
         self._settings = settings
         self._factory: GarminFactory = garmin_factory or _default_garmin_factory
         self._lock = Lock()
@@ -105,27 +91,29 @@ class GarminAuthenticator:
         # from "the token went away and the owner has to sign in again".
         self._was_linked = settings.token_file.is_file()
 
-    def status(self) -> AuthStatus:
+    def status(self) -> LinkStatus:
         """The link state and the guidance that follows from it.
 
         ``detail`` is derived from the state alone, so reading it is idempotent.
         Failures are not status -- they are a flash, read with take_error().
         """
         if self._settings.token_file.is_file():
-            return AuthStatus(LinkState.LINKED, self._email)
+            return LinkStatus(LinkState.LINKED, self._email)
         if self._pending is not None:
-            return AuthStatus(
-                LinkState.AWAITING_MFA,
+            # PENDING is the generic state; the MFA wording is what makes it
+            # actionable, and detail is where a provider says so.
+            return LinkStatus(
+                LinkState.PENDING,
                 self._pending.email,
                 "Enter the code Garmin just sent you to finish linking.",
             )
         if self._was_linked:
-            return AuthStatus(
+            return LinkStatus(
                 LinkState.NEEDS_REAUTH,
                 self._email,
                 "The saved Garmin token is no longer on disk. Sign in again to relink.",
             )
-        return AuthStatus(LinkState.NOT_LINKED, self._email)
+        return LinkStatus(LinkState.NOT_LINKED, self._email)
 
     def peek_error(self) -> str | None:
         """Read the pending failure without clearing it (for pollable endpoints)."""
@@ -136,15 +124,15 @@ class GarminAuthenticator:
         error, self._error = self._error, None
         return error
 
-    async def login(self, email: str, password: str) -> AuthStatus:
+    async def login(self, email: str, password: str) -> LinkStatus:
         """Start a login. GarminDB and garminconnect are entirely synchronous, so
         this must never run on the event loop."""
         return await anyio.to_thread.run_sync(self._login_sync, email, password)
 
-    async def complete_mfa(self, code: str) -> AuthStatus:
+    async def complete_mfa(self, code: str) -> LinkStatus:
         return await anyio.to_thread.run_sync(self._complete_mfa_sync, code)
 
-    async def link_with_token(self, raw: str, *, email: str = "") -> AuthStatus:
+    async def link_with_token(self, raw: str, *, email: str = "") -> LinkStatus:
         """Link using a token minted elsewhere, bypassing the sign-in portal.
 
         Garmin's SSO portal sits behind a Cloudflare bot challenge that a
@@ -161,7 +149,7 @@ class GarminAuthenticator:
         """
         return await anyio.to_thread.run_sync(self._link_with_token_sync, raw, email)
 
-    async def unlink(self) -> AuthStatus:
+    async def unlink(self) -> LinkStatus:
         return await anyio.to_thread.run_sync(self._unlink_sync)
 
     def _fail(self, message: str) -> AuthError:
@@ -183,7 +171,7 @@ class GarminAuthenticator:
         if not self._settings.token_file.is_file():
             raise self._fail("Signed in to Garmin but the token file was not written.")
 
-    def _login_sync(self, email: str, password: str) -> AuthStatus:
+    def _login_sync(self, email: str, password: str) -> LinkStatus:
         email = (email or "").strip()
         if not email or not password:
             raise self._fail("Enter both your Garmin Connect email and password.")
@@ -216,7 +204,7 @@ class GarminAuthenticator:
             self._error = None
             return self.status()
 
-    def _complete_mfa_sync(self, code: str) -> AuthStatus:
+    def _complete_mfa_sync(self, code: str) -> LinkStatus:
         code = (code or "").strip()
         with self._lock:
             pending = self._pending
@@ -271,7 +259,7 @@ class GarminAuthenticator:
             )
         return text
 
-    def _link_with_token_sync(self, raw: str, email: str) -> AuthStatus:
+    def _link_with_token_sync(self, raw: str, email: str) -> LinkStatus:
         email = (email or "").strip()
         try:
             token = self._validated_token(raw)
@@ -308,7 +296,7 @@ class GarminAuthenticator:
             logger.info("Garmin account linked from an imported token.")
             return self.status()
 
-    def _unlink_sync(self) -> AuthStatus:
+    def _unlink_sync(self) -> LinkStatus:
         with self._lock:
             self._pending = None
             self._settings.token_file.unlink(missing_ok=True)

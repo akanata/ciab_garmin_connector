@@ -19,15 +19,14 @@ from health_data_service import Sample
 from sqlalchemy.orm import Session
 
 from garmin_health.config import MAX_SESSION_SUBSERIES
+from garmin_health.limits import decimate
+from garmin_health.ports import SOURCE
 from garmin_health.providers.garmindb.sampling import column_series
-from garmin_health.providers.garmindb.sampling import decimate
 from garmin_health.providers.garmindb.sampling import has_rows
 from garmin_health.providers.garmindb.sampling import period_rows
-from garmin_health.timezones import TimeZonePolicy
+from garmin_health.providers.garmindb.timezones import TimeZonePolicy
 
 logger = logging.getLogger(__name__)
-
-SOURCE = "garmin"
 
 # monitoring_hr.heart_rate is an Integer column; the spec carries Sample[float].
 build_heart_rate = column_series(

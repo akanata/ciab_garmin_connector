@@ -44,21 +44,21 @@ from garmindb.garmindb import RestingHeartRate
 from garmindb.garmindb import Sleep
 from garmindb.garmindb import SleepEvents
 
-from garmin_health.config import Settings
-from garmin_health.garmin_config import load_manager
+from garmin_health.progress import ProgressSink
+from garmin_health.progress import no_progress
+from garmin_health.providers.garmindb.config_file import load_manager
 
 # TableStat is a plain value object on the port between sync.py and this adapter;
 # importing it here does not drag garmindb into sync.py, which is what keeps the
 # engine testable and GarminDB swappable.
-from garmin_health.preferences import STAT_LABELS
+from garmin_health.providers.garmindb.preferences import STAT_LABELS
+from garmin_health.providers.garmindb.settings import GarminDbSettings
+from garmin_health.providers.garmindb.sync import StatCoverage
+from garmin_health.providers.garmindb.sync import TableStat
+from garmin_health.providers.garmindb.sync import incremental_range
 from garmin_health.providers.garmindb.timezone_probe import read_stored_time_zone
-from garmin_health.sync import ProgressSink
-from garmin_health.sync import StatCoverage
-from garmin_health.sync import TableStat
-from garmin_health.sync import _no_progress
-from garmin_health.sync import incremental_range
-from garmin_health.timezones import TimeZoneUnresolved
-from garmin_health.timezones import resolve_home_tz
+from garmin_health.providers.garmindb.timezones import TimeZoneUnresolved
+from garmin_health.providers.garmindb.timezones import resolve_home_tz
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ class GarminDbIngest:
 
     def __init__(
         self,
-        settings: Settings,
+        settings: GarminDbSettings,
         *,
         bindings: Bindings | None = None,
         clock: Callable[[], dt.datetime] = _utcnow,
@@ -338,7 +338,7 @@ class GarminDbIngest:
             self._fetch(download, stat, date, days)
         progress(f"{verb} finished", total, total)
 
-    def download(self, stop: Event, progress: ProgressSink = _no_progress) -> None:
+    def download(self, stop: Event, progress: ProgressSink = no_progress) -> None:
         """Fetch JSON/FIT files forward from each stat's newest row.
 
         Each stat sleeps a second per day and retries five times with backoff, so
@@ -366,7 +366,7 @@ class GarminDbIngest:
             plan[stat] = (floor, coverage.missing_days)
         return plan
 
-    def backfill(self, stop: Event, progress: ProgressSink = _no_progress) -> None:
+    def backfill(self, stop: Event, progress: ProgressSink = no_progress) -> None:
         """Fetch only the older range each enabled metric is missing."""
         plan = self.backfill_plan()
         if not plan:
@@ -397,7 +397,7 @@ class GarminDbIngest:
     def import_(
         self,
         stop: Event,
-        progress: ProgressSink = _no_progress,
+        progress: ProgressSink = no_progress,
         *,
         latest: bool = IMPORT_LATEST,
     ) -> None:
@@ -466,7 +466,7 @@ class GarminDbIngest:
 
     # -- rebuild --------------------------------------------------------------
 
-    def rebuild(self, stop: Event, progress: ProgressSink = _no_progress) -> None:
+    def rebuild(self, stop: Event, progress: ProgressSink = no_progress) -> None:
         """Delete both SQLite files and reimport the whole retained corpus.
 
         The owner's way out of a schema mismatch. There is no download: persisting

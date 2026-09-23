@@ -19,10 +19,10 @@ from typing import Any
 import dateutil.parser
 from garmindb import GarminConnectConfigManager
 
-from garmin_health.config import Settings
-from garmin_health.preferences import DOWNLOADABLE_STATS
-from garmin_health.preferences import ImportPreferences
-from garmin_health.preferences import load_preferences
+from garmin_health.providers.garmindb.preferences import DOWNLOADABLE_STATS
+from garmin_health.providers.garmindb.preferences import ImportPreferences
+from garmin_health.providers.garmindb.preferences import load_preferences
+from garmin_health.providers.garmindb.settings import GarminDbSettings
 
 REQUIRED_SECTIONS = ("db", "garmin", "credentials", "data", "directories", "enabled_stats")
 
@@ -32,7 +32,7 @@ class InvalidGarminConfig(Exception):
 
 
 def render_config(
-    settings: Settings, *, user: str = "", preferences: ImportPreferences | None = None
+    settings: GarminDbSettings, *, user: str = "", preferences: ImportPreferences | None = None
 ) -> dict[str, Any]:
     """Build the config document GarminDB will read.
 
@@ -149,7 +149,7 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
-def read_config(settings: Settings) -> dict[str, Any]:
+def read_config(settings: GarminDbSettings) -> dict[str, Any]:
     """Return the on-disk config, or raise InvalidGarminConfig."""
     try:
         raw = json.loads(settings.garmin_config_file.read_text(encoding="utf-8"))
@@ -159,7 +159,7 @@ def read_config(settings: Settings) -> dict[str, Any]:
     return dict(raw)
 
 
-def config_user(settings: Settings) -> str | None:
+def config_user(settings: GarminDbSettings) -> str | None:
     """The Garmin account recorded in the config, or None if absent/unreadable."""
     try:
         raw = read_config(settings)
@@ -170,7 +170,10 @@ def config_user(settings: Settings) -> str | None:
 
 
 def ensure_config(
-    settings: Settings, *, user: str | None = None, preferences: ImportPreferences | None = None
+    settings: GarminDbSettings,
+    *,
+    user: str | None = None,
+    preferences: ImportPreferences | None = None,
 ) -> Path:
     """Write a valid config, preserving the recorded user unless one is given.
 
@@ -188,7 +191,7 @@ def ensure_config(
     return settings.garmin_config_file
 
 
-def load_manager(settings: Settings, *, repair: bool = True) -> GarminConnectConfigManager:
+def load_manager(settings: GarminDbSettings, *, repair: bool = True) -> GarminConnectConfigManager:
     """Return a GarminConnectConfigManager, never letting it reach sys.exit(-1)."""
     if repair:
         ensure_config(settings)

@@ -37,6 +37,8 @@ from zoneinfo import ZoneInfo
 
 import attrs
 
+from garmin_health.errors import ProviderNotReady
+
 logger = logging.getLogger(__name__)
 
 # Every real UTC offset is a whole number of quarter hours, so the difference of
@@ -49,8 +51,14 @@ MAX_PLAUSIBLE_OFFSET = dt.timedelta(hours=26)
 DEFAULT_PROBE_NIGHTS = 90
 
 
-class TimeZoneUnresolved(Exception):
-    """The account's home timezone could not be determined."""
+class TimeZoneUnresolved(ProviderNotReady):
+    """The account's home timezone could not be determined.
+
+    Deliberately on the *not ready* branch: before the first sync there is no
+    stored zone and nothing to serve either, which is an empty 200 rather than a
+    fault. Once there is data, the same failure is a 503 -- ``service.py`` is
+    what tells those two apart.
+    """
 
 
 @attrs.frozen

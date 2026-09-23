@@ -1,149 +1,124 @@
-"""The metric catalog: declarative data, and the invariants that keep it honest."""
+"""``MetricEntry``: what every provider's catalog entry has to be.
+
+The entries themselves are a provider's business -- GarminDB's four live in
+``tests/providers/garmindb/test_registry.py``. What is here is the record they
+all have to fit, and the one structural trap it exists to prevent.
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
+import datetime as dt
+from typing import Any
 
 import attrs
 import pytest
-from health_data_service import IntervalSample
+from health_data_service import HRV_RMSSD
+from health_data_service import HeartRate
 from health_data_service import MetricKind
+from health_data_service import Sample
+from health_data_service import SleepScore
 from health_data_service import SleepStages
 from health_data_service import TimeSeries
 
-from garmin_health.config import Settings
-from garmin_health.providers.garmindb.connection import GarminConnection
-from garmin_health.registry import METRICS
+from garmin_health.ports import SOURCE
 from garmin_health.registry import MetricEntry
-from tests.providers.garmindb.fixtures import HOME_TZ_NAME
-from tests.providers.garmindb.fixtures import build_fixture
+from garmin_health.registry import metric_entry
 
 
-@pytest.fixture
-def corpus_settings(tmp_path: Path) -> Settings:
-    return Settings(app_data_dir=tmp_path / "appdata", home_tz=HOME_TZ_NAME)
+def _no_samples(
+    start: dt.datetime | None, end: dt.datetime | None, limit: int | None
+) -> list[Sample[Any]]:
+    return []
 
 
-def test_every_key_is_its_own_metric_id() -> None:
-    for key, entry in METRICS.items():
-        assert key == entry.descriptor.metric_id
+def _entry(series_cls: type[TimeSeries] = HeartRate, **kwargs: Any) -> MetricEntry:
+    kwargs.setdefault("build", _no_samples)
+    kwargs.setdefault("probe", lambda: True)
+    kwargs.setdefault("provenance", "test:column")
+    return metric_entry(series_cls, **kwargs)
 
 
-def test_metric_ids_are_unique() -> None:
-    ids = [e.descriptor.metric_id for e in METRICS.values()]
-    assert len(set(ids)) == len(ids)
+class TestMetricEntry:
+    def test_the_descriptor_is_taken_from_the_spec_class(self) -> None:
+        """Restating metric_id or display_name here would let the catalog drift
+        from what the series actually says it is."""
+        entry = _entry(HeartRate)
+        assert entry.descriptor.metric_id == "heart_rate"
+        assert entry.descriptor.display_name == HeartRate(source=SOURCE).display_name
+
+    def test_every_metric_is_advertised_as_a_time_series(self) -> None:
+        assert _entry(SleepScore).descriptor.kind is MetricKind.TIME_SERIES
+
+    def test_the_unit_defaults_to_the_spec_classes_own(self) -> None:
+        assert _entry(HeartRate).descriptor.unit == "bpm"
+
+    def test_a_unit_can_be_overridden_where_the_column_has_a_real_one(self) -> None:
+        """The spec defaults HRV's unit to None, but the column is RMSSD in ms."""
+        entry = _entry(HRV_RMSSD, unit="ms")
+        assert entry.descriptor.unit == "ms"
+        assert entry.series([]).unit == "ms"
+
+    def test_an_explicit_none_unit_is_kept(self) -> None:
+        """Distinct from 'not given': a 0-100 score genuinely has no unit."""
+        assert _entry(SleepScore, unit=None).descriptor.unit is None
+
+    def test_the_descriptor_matches_the_series_it_will_build(self) -> None:
+        """A descriptor advertising bpm for a series that emits ms would be a
+        silent unit error in a merged cross-provider list."""
+        for series_cls in (HeartRate, SleepScore):
+            entry = _entry(series_cls)
+            series = entry.series([])
+            assert entry.descriptor.metric_id == series.metric_id
+            assert entry.descriptor.display_name == series.display_name
+            assert entry.descriptor.unit == series.unit
+
+    def test_a_built_series_carries_the_source_and_the_samples(self) -> None:
+        samples = [Sample(timestamp=dt.datetime(2026, 9, 15, tzinfo=dt.UTC), value=60.0)]
+        series = _entry(HeartRate).series(samples)
+        assert isinstance(series, HeartRate)
+        assert series.source == SOURCE
+        assert series.samples == samples
+
+    def test_an_entry_is_frozen_data(self) -> None:
+        entry = _entry()
+        assert isinstance(entry, MetricEntry)
+        with pytest.raises(attrs.exceptions.FrozenInstanceError):
+            entry.provenance = "somewhere else"  # type: ignore[misc]
+
+    def test_a_builder_takes_only_a_window_and_a_limit(self) -> None:
+        """Bound, with no connection argument: a provider closes over whatever it
+        reads from, so this record stays free of any provider's types."""
+        seen: list[tuple[Any, Any, Any]] = []
+
+        def build(
+            start: dt.datetime | None, end: dt.datetime | None, limit: int | None
+        ) -> list[Sample[Any]]:
+            seen.append((start, end, limit))
+            return []
+
+        _entry(build=build).build(None, None, 5)
+        assert seen == [(None, None, 5)]
+
+    def test_a_probe_takes_nothing(self) -> None:
+        assert _entry(probe=lambda: False).probe() is False
 
 
-def test_this_iteration_serves_the_four_planned_metrics() -> None:
-    assert set(METRICS) == {
-        "heart_rate",
-        "hrv_rmssd",
-        "sleep_score",
-        "readiness_resting_heart_rate",
-    }
-
-
-def test_every_descriptor_matches_the_series_it_will_build() -> None:
-    """A descriptor advertising bpm for a series that emits ms would be a silent
-    unit error in a merged cross-provider list."""
-    for entry in METRICS.values():
-        series = entry.series([])
-        assert entry.descriptor.metric_id == series.metric_id
-        assert entry.descriptor.display_name == series.display_name
-        assert entry.descriptor.unit == series.unit
-
-
-def test_every_metric_is_a_time_series() -> None:
-    assert all(e.descriptor.kind is MetricKind.TIME_SERIES for e in METRICS.values())
-
-
-@pytest.mark.parametrize(
-    ("metric_id", "unit"),
-    [
-        ("heart_rate", "bpm"),
-        # The spec defaults both of these to None; the columns have real units.
-        ("hrv_rmssd", "ms"),
-        ("readiness_resting_heart_rate", "bpm"),
-        # A 0-100 score genuinely has no unit.
-        ("sleep_score", None),
-    ],
-)
-def test_the_units_we_override(metric_id: str, unit: str | None) -> None:
-    assert METRICS[metric_id].descriptor.unit == unit
-
-
-def test_every_entry_names_the_column_it_reads() -> None:
-    """Provenance is what makes a wrong number traceable to a table."""
-    for entry in METRICS.values():
-        assert ".db:" in entry.provenance
-
-
-def test_no_entry_can_ever_yield_an_interval_sample() -> None:
-    """The hazard this guards, in full: TimeSeries.samples is declared as bare
-    list[Sample], and the consumer's client registers a structure hook for Sample
-    that resolves by MRO -- so an IntervalSample served on /v1/time-series comes
-    back with end_timestamp silently discarded. Sleep stages must reach consumers
-    only through SleepSession.stages.
-
-    Checked structurally rather than by sampling data, so an entry added against an
-    empty table cannot slip through.
+class TestNoIntervalSamples:
+    """TimeSeries.samples is declared as bare list[Sample], and the consumer's
+    client registers a structure hook for Sample that resolves by MRO -- so an
+    IntervalSample served on /v1/time-series comes back with end_timestamp
+    silently discarded. Sleep stages must reach consumers only through
+    SleepSession.stages.
     """
-    for entry in METRICS.values():
-        annotation = attrs.fields(entry.series_cls).samples.type
-        assert "IntervalSample" not in str(annotation), entry.descriptor.metric_id
 
+    @pytest.mark.parametrize("series_cls", [HeartRate, HRV_RMSSD, SleepScore])
+    def test_a_servable_class_never_yields_interval_samples(
+        self, series_cls: type[TimeSeries]
+    ) -> None:
+        annotation = attrs.fields(series_cls).samples.type
+        assert "IntervalSample" not in str(annotation)
 
-def test_the_structural_guard_would_actually_catch_the_bad_case() -> None:
-    """A guard that cannot fail is not a guard. SleepStages is the real class this
-    is protecting against, so it must trip the same check."""
-    assert "IntervalSample" in str(attrs.fields(SleepStages).samples.type)
-
-
-def test_built_samples_are_never_interval_samples(corpus_settings: Settings) -> None:
-    build_fixture(
-        corpus_settings.health_data_dir,
-        nights=3,
-        heart_rate=True,
-        hrv=True,
-        sleep_score=82,
-        resting_hr=True,
-    )
-    with GarminConnection(corpus_settings) as conn:
-        for entry in METRICS.values():
-            samples = entry.build(conn, None, None, None)
-            assert samples, entry.descriptor.metric_id
-            assert not any(isinstance(s, IntervalSample) for s in samples)
-
-
-def test_every_entry_builds_a_series_of_its_own_class(corpus_settings: Settings) -> None:
-    build_fixture(corpus_settings.health_data_dir, nights=1, heart_rate=True)
-    with GarminConnection(corpus_settings) as conn:
-        for entry in METRICS.values():
-            series = entry.series(entry.build(conn, None, None, None))
-            assert isinstance(series, entry.series_cls)
-            assert isinstance(series, TimeSeries)
-            assert series.source == "garmin"
-
-
-def test_probes_report_an_empty_corpus_as_having_nothing(
-    corpus_settings: Settings,
-) -> None:
-    """/v1/metrics filters on the probe because list_metrics_merged is what a
-    consumer uses to decide what to request."""
-    build_fixture(corpus_settings.health_data_dir, nights=0)
-    with GarminConnection(corpus_settings) as conn:
-        assert not any(entry.probe(conn) for entry in METRICS.values())
-
-
-def test_probes_report_exactly_what_the_corpus_holds(corpus_settings: Settings) -> None:
-    build_fixture(corpus_settings.health_data_dir, nights=1, heart_rate=True)
-    with GarminConnection(corpus_settings) as conn:
-        advertised = {k for k, e in METRICS.items() if e.probe(conn)}
-    assert advertised == {"heart_rate"}
-
-
-def test_an_entry_is_frozen_data(corpus_settings: Settings) -> None:
-    entry = METRICS["heart_rate"]
-    assert isinstance(entry, MetricEntry)
-    with pytest.raises(attrs.exceptions.FrozenInstanceError):
-        entry.provenance = "somewhere else"  # type: ignore[misc]
+    def test_the_structural_guard_would_actually_catch_the_bad_case(self) -> None:
+        """A guard that cannot fail is not a guard. SleepStages is the real class
+        this protects against, so it must trip the same check."""
+        assert "IntervalSample" in str(attrs.fields(SleepStages).samples.type)

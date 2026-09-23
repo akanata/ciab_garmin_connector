@@ -22,9 +22,9 @@ from garmindb.garmindb import Sleep
 from health_data_service import Sample
 from sqlalchemy.orm import Session
 
+from garmin_health.limits import decimate
 from garmin_health.providers.garmindb.connection import GarminConnection
 from garmin_health.providers.garmindb.sampling import column_series
-from garmin_health.providers.garmindb.sampling import decimate
 from garmin_health.providers.garmindb.sampling import has_rows
 from garmin_health.providers.garmindb.sampling import period_rows
 

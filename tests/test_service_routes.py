@@ -1,60 +1,46 @@
-"""The /v1/* surface, exercised over real HTTP and read back with the spec's client."""
+"""``/api/v1/*``: status codes, envelopes, and the manifest that routes to them.
+
+Mounted over a :class:`FakeReader`, with no app and no corpus, because none of
+these rules are a provider's. The GarminDB half -- real sample counts, the scan
+cap, the rebuild path -- is in ``tests/providers/garmindb/test_service_routes.py``.
+"""
 
 from __future__ import annotations
 
 import datetime as dt
-import sqlite3
-import time
 import tomllib
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from health_data_service import MetricType
-from health_data_service import SleepSession
 from health_data_service import TimeSeries
 from health_data_service.client import converter as consumer_converter
+from litestar import Litestar
+from litestar.datastructures import State
 from litestar.testing import TestClient
 
-from garmin_health.app import create_app
-from garmin_health.auth import GarminAuthenticator
 from garmin_health.config import Settings
-from tests.providers.garmindb.fakes import RecordingFactory
-from tests.providers.garmindb.fixtures import HOME_TZ_NAME
-from tests.providers.garmindb.fixtures import Fixture
-from tests.providers.garmindb.fixtures import build_fixture
-
-OWNER = {"X-OpenHost-Is-Owner": "true"}
-
-
-@pytest.fixture
-def corpus_settings(tmp_path: Path) -> Settings:
-    return Settings(app_data_dir=tmp_path / "appdata", home_tz=HOME_TZ_NAME)
+from garmin_health.providers import build_provider
+from garmin_health.routes.service import v1_router
+from garmin_health.service import HealthDataService
+from tests.fakes import EPOCH
+from tests.fakes import SAMPLE_COUNT
+from tests.fakes import FakeReader
 
 
-@pytest.fixture
-def corpus(corpus_settings: Settings) -> Fixture:
-    return build_fixture(
-        corpus_settings.health_data_dir,
-        nights=3,
-        heart_rate=True,
-        hrv=True,
-        sleep_score=82,
-        resting_hr=True,
-        avg_rr=14.5,
-    )
-
-
-@pytest.fixture
-def client(corpus_settings: Settings, corpus: Fixture) -> Iterator[TestClient]:
-    app = create_app(
-        settings=corpus_settings,
-        authenticator=GarminAuthenticator(
-            corpus_settings, garmin_factory=RecordingFactory(needs_mfa=False)
-        ),
+def client_for(reader: FakeReader) -> Iterator[TestClient]:
+    app = Litestar(
+        route_handlers=[v1_router],
+        state=State({"health_service": HealthDataService(reader)}),
     )
     with TestClient(app=app) as c:
         yield c
+
+
+@pytest.fixture
+def client() -> Iterator[TestClient]:
+    yield from client_for(FakeReader())
 
 
 class TestMetrics:
@@ -66,16 +52,11 @@ class TestMetrics:
     def test_the_catalog_structures_with_the_consumers_converter(self, client: TestClient) -> None:
         payload = client.get("/api/v1/metrics").json()
         descriptors = consumer_converter.structure(payload["metrics"], list[MetricType])
-        assert {d.metric_id for d in descriptors} == {
-            "heart_rate",
-            "hrv_rmssd",
-            "sleep_score",
-            "readiness_resting_heart_rate",
-        }
+        assert {d.metric_id for d in descriptors} == {"heart_rate"}
 
     def test_it_is_not_owner_gated(self, client: TestClient) -> None:
-        """/api/v1/* arrives through the router's internal service proxy, which stamps
-        consumer headers rather than the owner one."""
+        """/api/v1/* arrives through the router's internal service proxy, which
+        stamps consumer headers rather than the owner one."""
         assert client.get("/api/v1/metrics").status_code == 200
 
 
@@ -87,60 +68,55 @@ class TestTimeSeries:
         assert payload["metric_id"] == "heart_rate"
         assert "data" not in payload
 
-    def test_it_round_trips_through_the_consumers_converter(
-        self, client: TestClient, corpus: Fixture
-    ) -> None:
-        response = client.get("/api/v1/time-series", params={"metric": "heart_rate", "limit": 10})
+    def test_it_round_trips_through_the_consumers_converter(self, client: TestClient) -> None:
+        response = client.get("/api/v1/time-series", params={"metric": "heart_rate"})
         series = consumer_converter.structure(response.json(), TimeSeries)
         assert series.unit == "bpm"
         assert series.source == "garmin"
-        assert len(series.samples) == 10
-        assert series.samples[0].timestamp == corpus.newest.start_utc
+        assert len(series.samples) == SAMPLE_COUNT
+        assert series.samples[0].timestamp == EPOCH
 
-    def test_the_window_is_honoured(self, client: TestClient, corpus: Fixture) -> None:
-        start = corpus.newest.start_utc
+    def test_the_window_is_honoured(self, client: TestClient) -> None:
         response = client.get(
             "/api/v1/time-series",
             params={
                 "metric": "heart_rate",
-                "start": start.isoformat(),
-                "end": (start + dt.timedelta(hours=1)).isoformat(),
+                "start": EPOCH.isoformat(),
+                "end": (EPOCH + dt.timedelta(minutes=6)).isoformat(),
             },
         )
-        assert len(response.json()["samples"]) == 30
+        assert len(response.json()["samples"]) == 3
 
     def test_it_accepts_the_timestamp_format_the_client_actually_sends(
-        self, client: TestClient, corpus: Fixture
+        self, client: TestClient
     ) -> None:
         """_to_params does str(v) on a datetime, which yields a SPACE separator
         rather than a T. Rejecting that would make every real consumer see a 400
         and read it as 'this provider has nothing'."""
-        start = corpus.newest.start_utc
         response = client.get(
             "/api/v1/time-series",
             params={
                 "metric": "heart_rate",
-                "start": str(start),
-                "end": str(start + dt.timedelta(hours=1)),
+                "start": str(EPOCH),
+                "end": str(EPOCH + dt.timedelta(minutes=6)),
             },
         )
         assert response.status_code == 200
-        assert len(response.json()["samples"]) == 30
+        assert len(response.json()["samples"]) == 3
 
-    def test_a_naive_bound_is_read_as_utc(self, client: TestClient, corpus: Fixture) -> None:
+    def test_a_naive_bound_is_read_as_utc(self, client: TestClient) -> None:
         """The spec says timestamps are aware UTC, so a naive one is a consumer
-        that forgot to say so, not a consumer meaning our container's local zone."""
-        start = corpus.newest.start_utc
+        that forgot to say so, not one meaning our container's local zone."""
         response = client.get(
             "/api/v1/time-series",
             params={
                 "metric": "heart_rate",
-                "start": start.replace(tzinfo=None).isoformat(),
-                "end": (start + dt.timedelta(hours=1)).replace(tzinfo=None).isoformat(),
+                "start": EPOCH.replace(tzinfo=None).isoformat(),
+                "end": (EPOCH + dt.timedelta(minutes=6)).replace(tzinfo=None).isoformat(),
             },
         )
         assert response.status_code == 200
-        assert len(response.json()["samples"]) == 30
+        assert len(response.json()["samples"]) == 3
 
     def test_an_unknown_metric_is_404(self, client: TestClient) -> None:
         assert client.get("/api/v1/time-series", params={"metric": "nope"}).status_code == 404
@@ -173,13 +149,6 @@ class TestTimeSeries:
         )
         assert response.status_code == 400
 
-    def test_an_over_large_window_is_413(
-        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr("garmin_health.providers.garmindb.sampling.MAX_ROWS_SCANNED", 5)
-        response = client.get("/api/v1/time-series", params={"metric": "heart_rate"})
-        assert response.status_code == 413
-
 
 class TestSleepSessions:
     def test_the_body_uses_the_data_envelope(self, client: TestClient) -> None:
@@ -187,37 +156,16 @@ class TestSleepSessions:
         assert response.status_code == 200
         assert list(response.json()) == ["data"]
 
-    def test_sessions_round_trip_with_their_stage_intervals_intact(
-        self, client: TestClient, corpus: Fixture
-    ) -> None:
-        """The end-to-end proof of the one real serialization trap: stages reach a
-        consumer only through SleepSession.stages, where the parametrized-generic
-        path keeps end_timestamp."""
-        payload = client.get("/api/v1/sleep-sessions").json()
-        sessions = consumer_converter.structure(payload["data"], list[SleepSession])
-
-        assert [s.id for s in sessions] == [n.session_id for n in reversed(corpus.nights)]
-        newest = sessions[0]
-        assert newest.start == corpus.newest.start_utc
-        assert newest.end == corpus.newest.end_utc
-        assert newest.source == "garmin"
-        assert newest.stages is not None
-        assert len(newest.stages.samples) == 8
-        assert newest.stages.samples[0].end_timestamp == newest.stages.samples[1].timestamp
-        assert newest.sleep_score is not None
-        assert newest.sleep_score.value == 82.0
-        assert newest.efficiency is not None
-        assert newest.efficiency.value == pytest.approx(87.5)
-
     def test_the_limit_is_honoured(self, client: TestClient) -> None:
         payload = client.get("/api/v1/sleep-sessions", params={"limit": 1}).json()
         assert len(payload["data"]) == 1
 
-    def test_the_window_is_honoured(self, client: TestClient, corpus: Fixture) -> None:
+    def test_the_window_is_honoured(self, client: TestClient) -> None:
         payload = client.get(
-            "/api/v1/sleep-sessions", params={"start": corpus.newest.start_utc.isoformat()}
+            "/api/v1/sleep-sessions",
+            params={"start": (EPOCH + dt.timedelta(days=1)).isoformat()},
         ).json()
-        assert len(payload["data"]) == 1
+        assert payload["data"] == []
 
     def test_an_unparseable_bound_is_400(self, client: TestClient) -> None:
         assert client.get("/api/v1/sleep-sessions", params={"start": "soon"}).status_code == 400
@@ -238,27 +186,8 @@ class TestWorkouts:
 
 class TestDegraded:
     @pytest.fixture
-    def broken_client(self, corpus_settings: Settings, corpus: Fixture) -> Iterator[TestClient]:
-        with sqlite3.connect(corpus_settings.db_dir / "garmin.db") as db:
-            db.execute("UPDATE _attributes SET value = '1' WHERE key = 'db.version'")
-        app = create_app(
-            settings=corpus_settings,
-            authenticator=GarminAuthenticator(
-                corpus_settings, garmin_factory=RecordingFactory(needs_mfa=False)
-            ),
-        )
-        with TestClient(app=app) as c:
-            yield c
-
-    def test_health_stays_ok_so_the_router_does_not_restart_loop_us(
-        self, broken_client: TestClient
-    ) -> None:
-        """The container is working; its corpus needs a rebuild. Failing the probe
-        would kill the very process the owner has to visit to fix it."""
-        assert broken_client.get("/health").status_code == 200
-
-    def test_the_owner_surface_stays_reachable(self, broken_client: TestClient) -> None:
-        assert broken_client.get("/setup", headers=OWNER).status_code == 200
+    def broken_client(self) -> Iterator[TestClient]:
+        yield from client_for(FakeReader(fault="The schema on disk must be rebuilt."))
 
     def test_time_series_reports_503(self, broken_client: TestClient) -> None:
         assert (
@@ -272,28 +201,15 @@ class TestDegraded:
     def test_the_catalog_is_empty_rather_than_failing(self, broken_client: TestClient) -> None:
         assert broken_client.get("/api/v1/metrics").json() == {"metrics": []}
 
-    def test_the_fault_is_visible_to_the_owner(self, broken_client: TestClient) -> None:
-        status = broken_client.get("/sync/status", headers=OWNER).json()
-        assert status["serving"]["available"] is False
-        assert "rebuild" in status["serving"]["fault"].lower()
-
 
 class TestNeverSynced:
     @pytest.fixture
-    def fresh_client(self, tmp_path: Path) -> Iterator[TestClient]:
-        settings = Settings(app_data_dir=tmp_path / "appdata")
-        app = create_app(
-            settings=settings,
-            authenticator=GarminAuthenticator(
-                settings, garmin_factory=RecordingFactory(needs_mfa=False)
-            ),
-        )
-        with TestClient(app=app) as c:
-            yield c
+    def fresh_client(self) -> Iterator[TestClient]:
+        yield from client_for(FakeReader(ready=False, has_data=False))
 
     def test_every_endpoint_answers_emptily(self, fresh_client: TestClient) -> None:
-        """A brand-new install has no data and no imported timezone. That is a
-        normal state awaiting a sync, not a failure."""
+        """A brand-new install has no data and no clock to place it on. That is a
+        normal state awaiting a first acquisition, not a failure."""
         assert fresh_client.get("/api/v1/metrics").json() == {"metrics": []}
         assert fresh_client.get("/api/v1/sleep-sessions").json() == {"data": []}
         series = fresh_client.get("/api/v1/time-series", params={"metric": "heart_rate"})
@@ -301,59 +217,17 @@ class TestNeverSynced:
         assert series.json()["samples"] == []
 
 
-class TestRebuildFromTheOwnerPage:
-    """A schema mismatch is otherwise a dead end: nothing but the owner can delete
-    the database files, and the container has no shell."""
-
+class TestNotReadyButPopulated:
     @pytest.fixture
-    def broken(self, corpus_settings: Settings, corpus: Fixture) -> Iterator[TestClient]:
-        with sqlite3.connect(corpus_settings.db_dir / "garmin.db") as db:
-            db.execute("UPDATE _attributes SET value = '1' WHERE key = 'db.version'")
-        app = create_app(
-            settings=corpus_settings,
-            authenticator=GarminAuthenticator(
-                corpus_settings, garmin_factory=RecordingFactory(needs_mfa=False)
-            ),
-        )
-        with TestClient(app=app) as c:
-            yield c
+    def stuck_client(self) -> Iterator[TestClient]:
+        yield from client_for(FakeReader(ready=False, has_data=True))
 
-    def test_the_setup_page_explains_the_fault(self, broken: TestClient) -> None:
-        page = broken.get("/setup", headers=OWNER).text
-        assert "rebuild" in page.lower()
-
-    def test_the_setup_page_offers_a_rebuild_control(self, broken: TestClient) -> None:
-        assert "action='/rebuild'" in broken.get("/setup", headers=OWNER).text
-
-    def test_a_healthy_corpus_offers_no_rebuild_control(self, client: TestClient) -> None:
-        """A destructive action should not be sitting there when nothing is wrong."""
-        assert "action='/rebuild'" not in client.get("/setup", headers=OWNER).text
-
-    def test_rebuild_is_owner_gated(self, broken: TestClient) -> None:
-        assert broken.request("POST", "/rebuild").status_code == 401
-
-    def test_rebuild_is_accepted_and_runs_in_the_background(self, broken: TestClient) -> None:
-        response = broken.post("/rebuild", headers=OWNER)
-        assert response.status_code == 202
-        assert response.json()["started"] is True
-
-    def test_rebuild_clears_the_fault_and_restores_service(
-        self, broken: TestClient, corpus_settings: Settings
-    ) -> None:
-        """End to end: the files are deleted, the current schema is created from
-        nothing, and the connection is reset so it stops pointing at the old inode."""
-        assert broken.get("/api/v1/sleep-sessions").status_code == 503
-
-        broken.post("/rebuild", headers=OWNER)
-        for _ in range(100):
-            if not broken.get("/sync/status", headers=OWNER).json()["running"]:
-                break
-            time.sleep(0.05)
-
-        status = broken.get("/sync/status", headers=OWNER).json()
-        assert status["last_sync"]["error"] is None
-        assert status["serving"]["available"] is True
-        assert broken.get("/api/v1/sleep-sessions").status_code == 200
+    def test_it_refuses_rather_than_reporting_no_history(self, stuck_client: TestClient) -> None:
+        """The other side of the same rule: this container holds data it cannot
+        place on a real clock, and an empty 200 would deny the history exists."""
+        response = stuck_client.get("/api/v1/time-series", params={"metric": "heart_rate"})
+        assert response.status_code == 503
+        assert stuck_client.get("/api/v1/sleep-sessions").status_code == 503
 
 
 MANIFEST = Path(__file__).resolve().parents[1] / "openhost.toml"
@@ -427,3 +301,23 @@ class TestManifestRoutingContract:
         """Only the path the router actually asks for is exposed. A second mount
         would be a public surface nothing uses and nothing tests against."""
         assert client.get("/v1/metrics").status_code == 404
+
+    def test_public_paths_matches_what_the_provider_serves_ungated(self, tmp_path: Path) -> None:
+        """Both directions, because both failures are silent.
+
+        A public route missing from ``public_paths`` is never forwarded to; a
+        ``public_paths`` entry nothing serves is a declared door onto a 404.
+
+        Vacuously true today -- every route is either the spec surface, reached
+        through the router's internal service proxy, or owner-gated. It becomes
+        load-bearing the moment a provider adds a webhook receiver, which is the
+        whole reason an aggregator would need one.
+
+        Asked of ``build_provider`` rather than a named provider, so this stays
+        true of whichever one the image ships.
+        """
+        manifest = tomllib.loads(MANIFEST.read_text())
+        declared = set(manifest["routing"]["public_paths"])
+        provider = build_provider(Settings(app_data_dir=tmp_path / "appdata"))
+        served = {path for handler in provider.public_routes() for path in handler.paths}
+        assert served == declared

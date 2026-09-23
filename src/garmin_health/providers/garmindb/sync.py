@@ -36,9 +36,11 @@ from typing import Protocol
 import anyio.to_thread
 import attrs
 
-from garmin_health.auth import GarminAuthenticator
-from garmin_health.auth import LinkState
-from garmin_health.config import Settings
+from garmin_health.ports import LinkState
+from garmin_health.progress import ProgressSink
+from garmin_health.progress import SyncStep
+from garmin_health.providers.garmindb.auth import GarminAuthenticator
+from garmin_health.providers.garmindb.settings import GarminDbSettings
 
 logger = logging.getLogger(__name__)
 
@@ -78,14 +80,6 @@ class TableStat:
 
     def as_dict(self) -> dict[str, Any]:
         return {"rows": self.rows, "latest": self.latest}
-
-
-ProgressSink = Callable[[str, int, int], None]
-"""``(what is happening now, steps finished, steps total)``. ``total`` 0 = unknown."""
-
-
-def _no_progress(label: str, done: int, total: int) -> None:
-    """Default sink, so the port can be driven without an engine attached."""
 
 
 @attrs.frozen
@@ -134,18 +128,6 @@ class StatCoverage:
             "floor": self.floor,
             "missing_days": self.missing_days,
         }
-
-
-@attrs.frozen
-class SyncStep:
-    """What the worker thread is doing right now."""
-
-    label: str
-    done: int = 0
-    total: int = 0
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"label": self.label, "done": self.done, "total": self.total}
 
 
 class Ingest(Protocol):
@@ -244,7 +226,7 @@ class SyncEngine:
     def __init__(
         self,
         *,
-        settings: Settings,
+        settings: GarminDbSettings,
         authenticator: GarminAuthenticator,
         ingest_factory: Callable[[], Ingest],
         clock: Callable[[], dt.datetime] = _utcnow,
@@ -396,8 +378,10 @@ class SyncEngine:
     def status(self) -> dict[str, Any]:
         step = self.step
         next_at = self.next_sync_at
+        # No link_state: the owner route reads that from the provider's
+        # AccountLink, which is its one source. Reporting it here too would be a
+        # second copy of the same wire field, free to drift.
         return {
-            "link_state": self._auth.status().state.value,
             "running": self.is_running,
             "interval_seconds": self._interval(),
             "next_sync_at": next_at.isoformat() if next_at else None,

@@ -10,6 +10,12 @@ dependencies = [
     "attrs>=24.1",
     "cattrs>=24.1",
     "GarminDb==3.9.0",
+    # Imported directly by providers/garmindb/auth.py, so it is declared rather
+    # than relied on as a transitive of GarminDb. Pinned to what GarminDb 3.9.0
+    # resolves to, because three 0.3.11 contracts are load-bearing and documented
+    # in AGENTS.md: return_on_mfa is a CONSTRUCTOR argument, login() never dumps
+    # the token in that mode, and resume_login ignores its client_state.
+    "garminconnect==0.3.11",
     "health-data-service @ git+https://github.com/cloud-in-a-bottle/health-data-service-spec@main",
 ]
 
@@ -52,6 +58,7 @@ select = [
     "UP",      # pyupgrade (modern Python syntax)
     "I",       # isort
     "PLC0415", # import-outside-top-level
+    "TID251",  # banned-api: the provider boundary, below
 ]
 ignore = ["E501"]  # line length handled by formatter
 
@@ -63,6 +70,30 @@ indent-style = "space"
 force-single-line = true
 case-sensitive = true
 known-first-party = ["garmin_health"]
+
+# The provider boundary, enforced at lint time. Everything crossing it is a
+# health_data_service type, a ports type, or a stdlib type -- never a database
+# handle, a session, or a vendor client.
+#
+# This table is GLOBAL, so it cannot express the reverse rule (that nothing under
+# providers/ may import the app). tests/test_boundary.py walks the import graph
+# for that half, and cross-checks this table so the two cannot drift apart.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"garmindb".msg = "Only garmin_health.providers.garmindb may import GarminDB (AGENTS.md: isolation rule)."
+"garminconnect".msg = "Only garmin_health.providers.garmindb may import garminconnect."
+"idbutils".msg = "Only garmin_health.providers.garmindb may import idbutils."
+"fitfile".msg = "Only garmin_health.providers.garmindb may import fitfile."
+"garth".msg = "Only garmin_health.providers.garmindb may import garth."
+"sqlalchemy".msg = "Only garmin_health.providers.garmindb may import SQLAlchemy; the core reads through ports.HealthReader."
+"garmin_health.providers.garmindb".msg = "The core must not name a concrete provider; go through garmin_health.providers.build_provider."
+
+[tool.ruff.lint.per-file-ignores]
+# The provider itself, which is the whole point of the ban.
+"src/garmin_health/providers/garmindb/**" = ["TID251"]
+# The selector: the one place a concrete provider is named, deliberately.
+"src/garmin_health/providers/__init__.py" = ["TID251"]
+# Corpus fixtures, GarminDB doubles, and the shared provider contract test.
+"tests/providers/**" = ["TID251"]
 
 [tool.mypy]
 python_version = "3.12"

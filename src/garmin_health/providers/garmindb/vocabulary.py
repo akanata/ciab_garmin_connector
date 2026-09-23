@@ -18,9 +18,10 @@ fails if either grows a member this table does not cover.
 from __future__ import annotations
 
 import logging
-import threading
 
 from health_data_service import SleepStage
+
+from garmin_health.warn_once import WarnOnce
 
 logger = logging.getLogger(__name__)
 
@@ -39,37 +40,25 @@ _STAGE_BY_EVENT: dict[str, SleepStage] = {
     "wake_time": SleepStage.AWAKE,
 }
 
-_lock = threading.Lock()
-_warned: set[str] = set()
-
 
 def known_events() -> frozenset[str]:
     """Every token this module maps. Used by the tests that read the live enums."""
     return frozenset(_STAGE_BY_EVENT)
 
 
-def reset_unknown_event_log() -> None:
-    """Forget which tokens have been warned about. A test seam."""
-    with _lock:
-        _warned.clear()
+# One WARNING per distinct token, ever. A night is hundreds of events, so warning
+# per row would bury the signal in its own noise -- and the entire point is to
+# make a new Garmin vocabulary visible instead of letting it degrade silently to
+# UNKNOWN. Given this module's own logger, so the warning still names the file
+# that has to be edited.
+_unmapped = WarnOnce(
+    logger,
+    "Unmapped Garmin sleep event %r; reporting it as UNKNOWN. Garmin has probably added a "
+    "sleep level -- add it to garmin_health.providers.garmindb.vocabulary.",
+)
 
-
-def _warn_once(token: str) -> None:
-    """One WARNING per distinct token, ever.
-
-    A night is hundreds of events, so warning per row would bury the signal in its
-    own noise -- and the entire point is to make a new Garmin vocabulary visible
-    instead of letting it degrade silently to UNKNOWN.
-    """
-    with _lock:
-        if token in _warned:
-            return
-        _warned.add(token)
-    logger.warning(
-        "Unmapped Garmin sleep event %r; reporting it as UNKNOWN. Garmin has probably added a "
-        "sleep level -- add it to garmin_health.providers.garmindb.vocabulary.",
-        token,
-    )
+#: Forget which tokens have been warned about. A test seam.
+reset_unknown_event_log = _unmapped.reset
 
 
 def stage_for_event(event: str | None) -> SleepStage:
@@ -81,6 +70,6 @@ def stage_for_event(event: str | None) -> SleepStage:
     normalized = "" if event is None else event.strip().lower()
     stage = _STAGE_BY_EVENT.get(normalized)
     if stage is None:
-        _warn_once(normalized)
+        _unmapped(normalized)
         return SleepStage.UNKNOWN
     return stage
